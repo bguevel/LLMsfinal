@@ -1,28 +1,118 @@
 from __future__ import annotations
 
+import json
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from logic import Var, And, Or, Imp, Formula
 from state import ProofState
+
 
 TACTICS = ["assumption", "intro", "split", "left", "right", "cases"]
 
 
-def proof_state_to_text(state: ProofState) -> str:
+TACTIC_DEFINITIONS = {
+    "assumption": "Use when the goal exactly appears in the assumptions. This closes the current goal.",
+    "intro": "Use when the goal is an implication A -> B. It assumes A and changes the goal to B.",
+    "split": "Use when the goal is an AND statement A /\\ B. It creates two goals: prove A and prove B.",
+    "left": "Use when the goal is an OR statement A \\/ B and you want to prove the left side A.",
+    "right": "Use when the goal is an OR statement A \\/ B and you want to prove the right side B.",
+    "cases": "Use when an assumption is an OR statement A \\/ B. It splits into two cases: assume A, and assume B.",
+}
+
+
+def formula_to_json(f: Formula) -> dict:
+    if isinstance(f, Var):
+        return {
+            "type": "var",
+            "name": f.name,
+        }
+
+    if isinstance(f, And):
+        return {
+            "type": "and",
+            "left": formula_to_json(f.left),
+            "right": formula_to_json(f.right),
+        }
+
+    if isinstance(f, Or):
+        return {
+            "type": "or",
+            "left": formula_to_json(f.left),
+            "right": formula_to_json(f.right),
+        }
+
+    if isinstance(f, Imp):
+        return {
+            "type": "imp",
+            "left": formula_to_json(f.left),
+            "right": formula_to_json(f.right),
+        }
+
+    raise TypeError(f"Unknown formula type: {type(f)}")
+
+
+def proof_state_to_json(state: ProofState) -> dict:
     if state.is_solved():
-        return "Proof is solved."
+        return {
+            "status": "solved",
+            "goals": [],
+        }
 
-    g = state.first_goal()
-    assert g is not None
+    goals = []
 
-    assumptions = ", ".join(str(a) for a in g.assumptions) if g.assumptions else "none"
-    goal = str(g.target)
+    for g in state.goals:
+        goals.append(
+            {
+                "assumptions": [formula_to_json(a) for a in g.assumptions],
+                "target": formula_to_json(g.target),
+            }
+        )
 
-    return (
-        f"Assumptions: {assumptions}\n"
-        f"Goal: {goal}\n"
-        f"Available tactics: {', '.join(TACTICS)}"
-    )
+    return {
+        "status": "unsolved",
+        "goals": goals,
+        "active_goal_index": 0,
+        "active_goal": goals[0],
+    }
+
+
+def proof_state_to_json_text(state: ProofState) -> str:
+    return json.dumps(proof_state_to_json(state), indent=2)
+
+
+def tactic_definitions_text() -> str:
+    lines = []
+    for tactic in TACTICS:
+        lines.append(f"- {tactic}: {TACTIC_DEFINITIONS[tactic]}")
+    return "\n".join(lines)
+
+
+def clean_tactic_name(text: str) -> str:
+    text = text.strip()
+    text = text.splitlines()[0].strip()
+    text = text.split(",")[0].strip()
+    text = text.split()[0].strip(".,:;[]{}()\"'")
+
+    return text
+
+
+def parse_ranked_tactics(response: str) -> list[str]:
+    response = response.replace("\n", ",")
+    raw_items = response.split(",")
+
+    ordered = []
+
+    for item in raw_items:
+        tactic = clean_tactic_name(item)
+        if tactic in TACTICS and tactic not in ordered:
+            ordered.append(tactic)
+
+    for tactic in TACTICS:
+        if tactic not in ordered:
+            ordered.append(tactic)
+
+    return ordered
 
 
 class PhiTacticModel:
@@ -32,9 +122,10 @@ class PhiTacticModel:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         self.model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    device_map="auto",)
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+        )
 
         self.model.config.use_cache = False
         self.model.eval()
@@ -42,13 +133,37 @@ class PhiTacticModel:
     def build_prompt(self, state: ProofState) -> str:
         return (
             "<|system|>\n"
-            "You are a proof-search assistant. "
-            "Choose exactly one tactic from the allowed list. "
-            "Return only the tactic name.\n"
+            "You are a proof-search policy model. "
+            "Your job is to choose the best next proof tactic. "
+            "You must use the tactic definitions exactly as given. "
+            "Return only one tactic name and no explanation.\n"
             "<|end|>\n"
             "<|user|>\n"
-            f"{proof_state_to_text(state)}\n\n"
-            "Which tactic should be applied next?\n"
+            "TACTIC DEFINITIONS:\n"
+            f"{tactic_definitions_text()}\n\n"
+            "PROOF STATE JSON:\n"
+            f"{proof_state_to_json_text(state)}\n\n"
+            f"Allowed tactics: {', '.join(TACTICS)}\n"
+            "Best next tactic:\n"
+            "<|end|>\n"
+            "<|assistant|>\n"
+        )
+
+    def build_ranking_prompt(self, state: ProofState) -> str:
+        return (
+            "<|system|>\n"
+            "You are a proof-search policy model. "
+            "Your job is to rank proof tactics from best to worst for the current proof state. "
+            "You must use the tactic definitions exactly as given. "
+            "Return only comma-separated tactic names and no explanation.\n"
+            "<|end|>\n"
+            "<|user|>\n"
+            "TACTIC DEFINITIONS:\n"
+            f"{tactic_definitions_text()}\n\n"
+            "PROOF STATE JSON:\n"
+            f"{proof_state_to_json_text(state)}\n\n"
+            f"Allowed tactics: {', '.join(TACTICS)}\n"
+            "Ranked tactics:\n"
             "<|end|>\n"
             "<|assistant|>\n"
         )
@@ -60,23 +175,46 @@ class PhiTacticModel:
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         generated = self.model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        use_cache=False,
-        pad_token_id=self.tokenizer.eos_token_id,)
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=False,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
 
         new_tokens = generated[0][inputs["input_ids"].shape[1]:]
         response = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-        response = response.splitlines()[0].strip()
-        response = response.split()[0].strip(".,:;")
+        tactic = clean_tactic_name(response)
 
-        return response
+        if tactic not in TACTICS:
+            return "assumption"
+
+        return tactic
+
+    @torch.no_grad()
+    def predict_tactic_order(self, state: ProofState) -> list[str]:
+        prompt = self.build_ranking_prompt(state)
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+        generated = self.model.generate(
+            **inputs,
+            max_new_tokens=48,
+            do_sample=False,
+            use_cache=False,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+
+        new_tokens = generated[0][inputs["input_ids"].shape[1]:]
+        response = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+        return parse_ranked_tactics(response)
 
     @torch.no_grad()
     def get_state_embedding(self, state: ProofState) -> torch.Tensor:
-        prompt = self.build_prompt(state)
+        prompt = self.build_ranking_prompt(state)
+
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         outputs = self.model(

@@ -1,10 +1,19 @@
 from __future__ import annotations
 from collections import deque
-from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import List, Set
 
 from state import ProofState, serialize_state
 from tactics import TACTIC_ORDER, apply_tactic
+
+
+@dataclass
+class SearchStep:
+    depth: int
+    state_before: str
+    llm_ranked_tactics: List[str]
+    tried_tactics: List[str]
+    valid_tactics_taken: List[str]
 
 
 @dataclass
@@ -13,57 +22,10 @@ class SearchResult:
     tactic_path: List[str]
     visited_states: int
     final_state: ProofState | None
+    trace: List[SearchStep] = field(default_factory=list)
 
-def llm_guided_search(initial_state: ProofState, tactic_model, max_steps: int = 20) -> SearchResult:
-    """
-    Greedy search guided by the LLM's top tactic proposal.
-    Falls back to trying all tactics if the proposed one is invalid.
-    """
-    state = initial_state
-    path: List[str] = []
-    visited: Set[str] = set()
-    visited_states = 0
-
-    for _ in range(max_steps):
-        visited_states += 1
-
-        if state.is_solved():
-            return SearchResult(True, path, visited_states, state)
-
-        key = serialize_state(state)
-        if key in visited:
-            break
-        visited.add(key)
-
-        proposed = tactic_model.predict_tactic(state)
-
-        # Try model proposal first
-        if proposed in TACTIC_ORDER:
-            nxt = apply_tactic(state, proposed)
-            if nxt is not None:
-                state = nxt
-                path.append(proposed)
-                continue
-
-        # Fallback: brute-force valid tactic if proposal failed
-        applied = False
-        for tactic in TACTIC_ORDER:
-            nxt = apply_tactic(state, tactic)
-            if nxt is not None:
-                state = nxt
-                path.append(tactic)
-                applied = True
-                break
-
-        if not applied:
-            break
-
-    return SearchResult(False, path, visited_states, state)
 
 def bfs_proof_search(initial_state: ProofState, max_steps: int = 20) -> SearchResult:
-    """
-    Breadth-first search over tactic sequences.
-    """
     queue = deque([(initial_state, [])])
     visited: Set[str] = set()
     visited_states = 0
@@ -73,12 +35,7 @@ def bfs_proof_search(initial_state: ProofState, max_steps: int = 20) -> SearchRe
         visited_states += 1
 
         if state.is_solved():
-            return SearchResult(
-                success=True,
-                tactic_path=path,
-                visited_states=visited_states,
-                final_state=state,
-            )
+            return SearchResult(True, path, visited_states, state)
 
         key = serialize_state(state)
         if key in visited:
@@ -93,9 +50,64 @@ def bfs_proof_search(initial_state: ProofState, max_steps: int = 20) -> SearchRe
             if nxt is not None:
                 queue.append((nxt, path + [tactic]))
 
-    return SearchResult(
-        success=False,
-        tactic_path=[],
-        visited_states=visited_states,
-        final_state=None,
-    )
+    return SearchResult(False, [], visited_states, None)
+
+
+def llm_topk_bfs(
+    initial_state: ProofState,
+    tactic_model,
+    top_k: int = 2,
+    max_steps: int = 20,
+) -> SearchResult:
+    """
+    LLM-guided BFS.
+
+    Important:
+    This search only tries the LLM's top-k tactics.
+    If the correct tactic is outside top-k, the search can fail.
+    """
+    queue = deque([(initial_state, [])])
+    visited: Set[str] = set()
+    visited_states = 0
+    trace: List[SearchStep] = []
+
+    while queue:
+        state, path = queue.popleft()
+        visited_states += 1
+
+        if state.is_solved():
+            return SearchResult(True, path, visited_states, state, trace)
+
+        key = serialize_state(state)
+        if key in visited:
+            continue
+        visited.add(key)
+
+        if len(path) >= max_steps:
+            continue
+
+        llm_order = tactic_model.predict_tactic_order(state)
+        chosen_tactics = llm_order[:top_k]
+
+        tried = []
+        valid_taken = []
+
+        for tactic in chosen_tactics:
+            tried.append(tactic)
+            nxt = apply_tactic(state, tactic)
+
+            if nxt is not None:
+                valid_taken.append(tactic)
+                queue.append((nxt, path + [tactic]))
+
+        trace.append(
+            SearchStep(
+                depth=len(path),
+                state_before=str(state),
+                llm_ranked_tactics=llm_order,
+                tried_tactics=tried,
+                valid_tactics_taken=valid_taken,
+            )
+        )
+
+    return SearchResult(False, [], visited_states, None, trace)
