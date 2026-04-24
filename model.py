@@ -25,59 +25,50 @@ def proof_state_to_text(state: ProofState) -> str:
     )
 
 
-class QwenTacticModel:
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
+class PhiTacticModel:
+    def __init__(self, model_name: str = "microsoft/Phi-3-mini-4k-instruct"):
         self.model_name = model_name
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype="auto",
-            device_map="auto",
-        )
+    model_name,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",)
+
+        self.model.config.use_cache = False
         self.model.eval()
 
-    def build_messages(self, state: ProofState):
-        prompt = (
-            "You are helping with a propositional-logic proof assistant.\n"
-            "Choose exactly one next tactic from this list:\n"
-            f"{', '.join(TACTICS)}\n\n"
-            "Return only the tactic name and nothing else.\n\n"
-            f"{proof_state_to_text(state)}\n"
-            "Next tactic:"
+    def build_prompt(self, state: ProofState) -> str:
+        return (
+            "<|system|>\n"
+            "You are a proof-search assistant. "
+            "Choose exactly one tactic from the allowed list. "
+            "Return only the tactic name.\n"
+            "<|end|>\n"
+            "<|user|>\n"
+            f"{proof_state_to_text(state)}\n\n"
+            "Which tactic should be applied next?\n"
+            "<|end|>\n"
+            "<|assistant|>\n"
         )
-
-        return [
-            {
-                "role": "system",
-                "content": "You are a careful reasoning assistant that outputs only one tactic name."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
 
     @torch.no_grad()
     def predict_tactic(self, state: ProofState, max_new_tokens: int = 8) -> str:
-        messages = self.build_messages(state)
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        prompt = self.build_prompt(state)
 
-        inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         generated = self.model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        use_cache=False,
+        pad_token_id=self.tokenizer.eos_token_id,)
 
         new_tokens = generated[0][inputs["input_ids"].shape[1]:]
         response = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
-        # Keep only first line/token-ish chunk
         response = response.splitlines()[0].strip()
         response = response.split()[0].strip(".,:;")
 
@@ -85,17 +76,8 @@ class QwenTacticModel:
 
     @torch.no_grad()
     def get_state_embedding(self, state: ProofState) -> torch.Tensor:
-        """
-        Returns a pooled hidden-state vector for probing later.
-        """
-        messages = self.build_messages(state)
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        prompt = self.build_prompt(state)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
         outputs = self.model(
             **inputs,
@@ -103,7 +85,7 @@ class QwenTacticModel:
             return_dict=True,
         )
 
-        # last layer, last token
-        last_hidden = outputs.hidden_states[-1]   # [batch, seq, hidden]
-        vec = last_hidden[:, -1, :]               # [batch, hidden]
+        last_hidden = outputs.hidden_states[-1]
+        vec = last_hidden[:, -1, :]
+
         return vec.squeeze(0).detach().cpu()
