@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from logic import Var, And, Or, Imp, Formula
 from state import ProofState
+from tree_encoding import HashingTreeEmbedder, proof_state_to_tree_text
 
 
 TACTICS = ["assumption", "intro", "split", "left", "right", "cases"]
@@ -116,8 +117,17 @@ def parse_ranked_tactics(response: str) -> list[str]:
 
 
 class PhiTacticModel:
-    def __init__(self, model_name: str = "microsoft/Phi-3-mini-4k-instruct"):
+    def __init__(
+        self,
+        model_name: str = "microsoft/Phi-3-mini-4k-instruct",
+        include_tree_in_prompt: bool = True,
+        concatenate_tree_embedding: bool = True,
+        tree_embedding_dim: int = 256,
+    ):
         self.model_name = model_name
+        self.include_tree_in_prompt = include_tree_in_prompt
+        self.concatenate_tree_embedding = concatenate_tree_embedding
+        self.tree_embedder = HashingTreeEmbedder(dim=tree_embedding_dim)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -129,6 +139,15 @@ class PhiTacticModel:
 
         self.model.config.use_cache = False
         self.model.eval()
+
+    def build_tree_prompt_block(self, state: ProofState) -> str:
+        if not self.include_tree_in_prompt:
+            return ""
+
+        return (
+            "PROOF STATE TREE ENCODINGS:\n"
+            f"{proof_state_to_tree_text(state)}\n\n"
+        )
 
     def build_prompt(self, state: ProofState) -> str:
         return (
@@ -143,6 +162,7 @@ class PhiTacticModel:
             f"{tactic_definitions_text()}\n\n"
             "PROOF STATE JSON:\n"
             f"{proof_state_to_json_text(state)}\n\n"
+            f"{self.build_tree_prompt_block(state)}"
             f"Allowed tactics: {', '.join(TACTICS)}\n"
             "Best next tactic:\n"
             "<|end|>\n"
@@ -162,6 +182,7 @@ class PhiTacticModel:
             f"{tactic_definitions_text()}\n\n"
             "PROOF STATE JSON:\n"
             f"{proof_state_to_json_text(state)}\n\n"
+            f"{self.build_tree_prompt_block(state)}"
             f"Allowed tactics: {', '.join(TACTICS)}\n"
             "Ranked tactics:\n"
             "<|end|>\n"
@@ -212,6 +233,10 @@ class PhiTacticModel:
         return parse_ranked_tactics(response)
 
     @torch.no_grad()
+    def get_tree_embedding(self, state: ProofState) -> torch.Tensor:
+        return self.tree_embedder.encode_state(state)
+
+    @torch.no_grad()
     def get_state_embedding(self, state: ProofState) -> torch.Tensor:
         prompt = self.build_ranking_prompt(state)
 
@@ -224,6 +249,10 @@ class PhiTacticModel:
         )
 
         last_hidden = outputs.hidden_states[-1]
-        vec = last_hidden[:, -1, :]
+        llm_vec = last_hidden[:, -1, :].squeeze(0).detach().cpu()
 
-        return vec.squeeze(0).detach().cpu()
+        if not self.concatenate_tree_embedding:
+            return llm_vec
+
+        tree_vec = self.get_tree_embedding(state)
+        return torch.cat([llm_vec, tree_vec], dim=0)

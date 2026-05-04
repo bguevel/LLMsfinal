@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataset import make_dataset
 from model import PhiTacticModel
 from search import bfs_proof_search, llm_topk_bfs
+from tree_encoding import proof_state_to_tree_text
 
 
 def choose_theorem():
@@ -73,6 +74,13 @@ def print_trace(result):
             print("\nValid branches added: none")
 
 
+def print_tree_encodings(state):
+    print("\n" + "=" * 60)
+    print("AST TREE ENCODINGS")
+    print("=" * 60)
+    print(proof_state_to_tree_text(state))
+
+
 def main():
     name, state = choose_theorem()
     top_k = choose_top_k()
@@ -82,6 +90,7 @@ def main():
     print("=" * 60)
     print(f"Theorem: {name}")
     print(state)
+    print_tree_encodings(state)
 
     print("\nRunning regular BFS baseline...")
     bfs_result = bfs_proof_search(state, max_steps=20)
@@ -95,7 +104,7 @@ def main():
     else:
         print("Path: none")
 
-    print("\nLoading Phi-3-mini...")
+    print("\nLoading Phi-3-mini with AST prompt context and a parallel tree embedding...")
     tactic_model = PhiTacticModel()
 
     print(f"\nRunning LLM-guided top-{top_k} BFS...")
