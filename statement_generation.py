@@ -22,6 +22,11 @@ from tree_encoding import formula_to_tree_record
 
 
 DEFAULT_VARIABLES = ("P", "Q", "R", "S")
+STATEMENT_QUESTION_PREFIX = "is this statement true"
+
+
+def statement_text_for_formula(formula: Formula) -> str:
+    return f"{STATEMENT_QUESTION_PREFIX} {formula}"
 
 
 @dataclass(frozen=True)
@@ -32,7 +37,7 @@ class LabeledStatement:
 
     @property
     def text(self) -> str:
-        return str(self.formula)
+        return statement_text_for_formula(self.formula)
 
 
 def check_statement_truth(formula: Formula) -> bool:
@@ -43,6 +48,15 @@ def check_statement_truth(formula: Formula) -> bool:
     tautologies. They may still be satisfiable under some assignments.
     """
     return is_tautology(formula)
+
+
+def verified_statement_label(formula: Formula, expected_label: bool, name: str = "<unnamed>") -> bool:
+    actual_label = check_statement_truth(formula)
+    if actual_label != expected_label:
+        raise ValueError(
+            f"Truth label mismatch for {name}: expected {expected_label}, got {actual_label}"
+        )
+    return actual_label
 
 
 def _random_variable(rng: random.Random, variables: Sequence[str]) -> Var:
@@ -95,7 +109,7 @@ def create_true_statement(
 
     for _ in range(100):
         formula = rng.choice(templates)()
-        if is_tautology(formula):
+        if check_statement_truth(formula):
             return formula
 
     raise RuntimeError("Could not generate a true statement")
@@ -125,7 +139,7 @@ def create_false_statement(
         else:
             formula = random_formula(max_depth, variables, rng)
 
-        if not is_tautology(formula):
+        if not check_statement_truth(formula):
             return formula
 
     raise RuntimeError("Could not generate a false statement")
@@ -144,9 +158,33 @@ def generate_labeled_statements(
     if not 0.0 <= true_fraction <= 1.0:
         raise ValueError("true_fraction must be between 0 and 1")
 
-    rng = random.Random(seed)
     true_count = int((n * true_fraction) + 0.5)
     false_count = n - true_count
+    return generate_labeled_statement_counts(
+        true_count=true_count,
+        false_count=false_count,
+        max_depth=max_depth,
+        variables=variables,
+        seed=seed,
+        unique=unique,
+    )
+
+
+def generate_labeled_statement_counts(
+    true_count: int,
+    false_count: int,
+    max_depth: int = 3,
+    variables: Sequence[str] = DEFAULT_VARIABLES,
+    seed: int | None = None,
+    unique: bool = True,
+) -> list[LabeledStatement]:
+    if true_count < 0:
+        raise ValueError("true_count must be non-negative")
+    if false_count < 0:
+        raise ValueError("false_count must be non-negative")
+
+    n = true_count + false_count
+    rng = random.Random(seed)
     targets = [True] * true_count + [False] * false_count
     rng.shuffle(targets)
 
@@ -190,10 +228,11 @@ def generate_labeled_statements(
 
 
 def statement_to_record(statement: LabeledStatement) -> dict:
+    actual_label = verified_statement_label(statement.formula, statement.label, statement.name)
     return {
         "name": statement.name,
         "label": statement.label,
-        "is_tautology": check_statement_truth(statement.formula),
+        "is_tautology": actual_label,
         "is_satisfiable": is_satisfiable(statement.formula),
         "text": statement.text,
         "formula": formula_to_dict(statement.formula),
@@ -204,11 +243,11 @@ def statement_to_record(statement: LabeledStatement) -> dict:
 def record_to_statement(record: dict) -> LabeledStatement:
     formula = formula_from_dict(record["formula"])
     label = bool(record["label"])
-    actual_label = check_statement_truth(formula)
-    if actual_label != label:
+    actual_label = verified_statement_label(formula, label, str(record.get("name", "<unnamed>")))
+    if "is_tautology" in record and bool(record["is_tautology"]) != actual_label:
         raise ValueError(
-            f"Stored label mismatch for {record.get('name', '<unnamed>')}: "
-            f"expected {label}, got {actual_label}"
+            f"Stored tautology metadata mismatch for {record.get('name', '<unnamed>')}: "
+            f"expected {actual_label}, got {record['is_tautology']}"
         )
 
     return LabeledStatement(
@@ -263,6 +302,27 @@ def generate_and_save_labeled_statements(
         variables=variables,
         seed=seed,
         true_fraction=true_fraction,
+        unique=unique,
+    )
+    save_labeled_statements(statements, output_path)
+    return statements
+
+
+def generate_and_save_labeled_statement_counts(
+    true_count: int,
+    false_count: int,
+    output_path: str | Path,
+    max_depth: int = 3,
+    variables: Sequence[str] = DEFAULT_VARIABLES,
+    seed: int | None = None,
+    unique: bool = True,
+) -> list[LabeledStatement]:
+    statements = generate_labeled_statement_counts(
+        true_count=true_count,
+        false_count=false_count,
+        max_depth=max_depth,
+        variables=variables,
+        seed=seed,
         unique=unique,
     )
     save_labeled_statements(statements, output_path)

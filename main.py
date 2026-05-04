@@ -15,7 +15,7 @@ from dataset import make_dataset
 from search import bfs_proof_search, llm_topk_bfs
 from statement_generation import (
     check_statement_truth,
-    generate_and_save_labeled_statements,
+    generate_and_save_labeled_statement_counts,
     load_labeled_statements,
 )
 from tree_codec import load_tree_codec, train_tree_codec
@@ -152,19 +152,23 @@ def print_tree_encodings(state):
 
 def generate_statement_file_menu() -> None:
     print("\n--- Generate true/false statements ---")
-    n = ask_int("How many statements should I generate?", default=100, minimum=1)
-    output_path = ask_path("Output JSONL filename", default=str(GENERATED_DATA_DEFAULT))
+    true_count = ask_int("How many true tautology statements should I generate?", default=50, minimum=0)
+    false_count = ask_int("How many false non-tautology statements should I generate?", default=50, minimum=0)
+    while true_count + false_count < 1:
+        print("[warn] Ask for at least one statement.")
+        true_count = ask_int("How many true tautology statements should I generate?", default=50, minimum=0)
+        false_count = ask_int("How many false non-tautology statements should I generate?", default=50, minimum=0)
+    output_path = ask_path("Training data JSONL filename", default=str(GENERATED_DATA_DEFAULT))
     max_depth = ask_int("Max formula depth", default=3, minimum=0)
     seed_raw = input("Seed (blank for random)> ").strip()
     seed = int(seed_raw) if seed_raw else None
-    true_fraction = ask_float("Fraction labeled true", default=0.5, minimum=0.0, maximum=1.0)
 
-    statements = generate_and_save_labeled_statements(
-        n=n,
+    statements = generate_and_save_labeled_statement_counts(
+        true_count=true_count,
+        false_count=false_count,
         output_path=output_path,
         max_depth=max_depth,
         seed=seed,
-        true_fraction=true_fraction,
     )
 
     true_count = sum(1 for item in statements if item.label)

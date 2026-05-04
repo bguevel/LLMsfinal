@@ -10,8 +10,10 @@ except ModuleNotFoundError:
 from dataset import make_dataset, make_truth_dataset
 from statement_generation import (
     check_statement_truth,
+    generate_and_save_labeled_statement_counts,
     generate_and_save_labeled_statements,
     load_labeled_statements,
+    statement_text_for_formula,
 )
 from tree_encoding import (
     HashingTreeEmbedder,
@@ -70,6 +72,28 @@ def test_generated_statement_file_round_trip() -> None:
         assert any(statement.label for statement in loaded)
         assert any(not statement.label for statement in loaded)
         assert all(check_statement_truth(statement.formula) == statement.label for statement in loaded)
+        assert all(statement.text.startswith("is this statement true ") for statement in loaded)
+        assert all(statement.text == statement_text_for_formula(statement.formula) for statement in loaded)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_generated_statement_counts_are_exact() -> None:
+    path = Path("_generated_statement_counts_test.jsonl")
+    try:
+        statements = generate_and_save_labeled_statement_counts(
+            true_count=5,
+            false_count=7,
+            output_path=path,
+            max_depth=2,
+            seed=11,
+        )
+        loaded = load_labeled_statements(path)
+
+        assert len(statements) == 12
+        assert sum(1 for statement in loaded if statement.label) == 5
+        assert sum(1 for statement in loaded if not statement.label) == 7
+        assert all(check_statement_truth(statement.formula) == statement.label for statement in loaded)
     finally:
         path.unlink(missing_ok=True)
 
@@ -79,4 +103,5 @@ if __name__ == "__main__":
     test_truth_dataset_labels_are_checked()
     test_hash_embedding_shape_and_stability()
     test_generated_statement_file_round_trip()
+    test_generated_statement_counts_are_exact()
     print("tree encoding checks passed")

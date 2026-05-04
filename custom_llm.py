@@ -27,7 +27,7 @@ except ModuleNotFoundError:
     F = None
 
 from logic import Formula
-from statement_generation import LabeledStatement
+from statement_generation import LabeledStatement, statement_text_for_formula
 from tree_encoding import FormulaTreeEncoder, HashingTreeEmbedder
 
 
@@ -181,8 +181,8 @@ def logic_token_text(text: str) -> str:
 def logic_formula_prompt(formula: Formula) -> str:
     return (
         "<STATEMENT>\n"
-        f"{logic_token_text(str(formula))}\n"
-        "<QUESTION> is this statement true under every truth assignment ?\n"
+        f"{logic_token_text(statement_text_for_formula(formula))}\n"
+        "<QUESTION> true under every truth assignment ?\n"
         "<ANSWER>:"
     )
 
@@ -435,7 +435,7 @@ def statement_prompt(statement: LabeledStatement, include_label: bool = True) ->
     prompt = (
         "Statement:\n"
         f"{statement.text}\n"
-        "Question: Is this statement true under every truth assignment?\n"
+        "Question: Is it true under every truth assignment?\n"
         "Answer:"
     )
     if include_label:
@@ -446,8 +446,8 @@ def statement_prompt(statement: LabeledStatement, include_label: bool = True) ->
 def formula_prompt(formula: Formula) -> str:
     return (
         "Statement:\n"
-        f"{formula}\n"
-        "Question: Is this statement true under every truth assignment?\n"
+        f"{statement_text_for_formula(formula)}\n"
+        "Question: Is it true under every truth assignment?\n"
         "Answer:"
     )
 
