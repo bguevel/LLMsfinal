@@ -10,8 +10,10 @@ except ModuleNotFoundError:
 from dataset import make_dataset, make_truth_dataset
 from statement_generation import (
     check_statement_truth,
+    DEFAULT_STATEMENT_COMPLEXITY,
     generate_and_save_labeled_statement_counts,
     generate_and_save_labeled_statements,
+    get_statement_complexity,
     load_labeled_statements,
     statement_text_for_formula,
 )
@@ -98,10 +100,22 @@ def test_generated_statement_counts_are_exact() -> None:
         path.unlink(missing_ok=True)
 
 
+def test_statement_complexity_presets_resolve() -> None:
+    default = get_statement_complexity(DEFAULT_STATEMENT_COMPLEXITY)
+    simple = get_statement_complexity("easy")
+    complex_level = get_statement_complexity("hard")
+
+    assert default.key == "moderate"
+    assert simple.key == "simple"
+    assert complex_level.key == "complex"
+    assert simple.max_depth < default.max_depth < complex_level.max_depth
+
+
 if __name__ == "__main__":
     test_formula_codecs_round_trip()
     test_truth_dataset_labels_are_checked()
     test_hash_embedding_shape_and_stability()
     test_generated_statement_file_round_trip()
     test_generated_statement_counts_are_exact()
+    test_statement_complexity_presets_resolve()
     print("tree encoding checks passed")

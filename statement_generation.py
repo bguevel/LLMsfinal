@@ -25,6 +25,68 @@ DEFAULT_VARIABLES = ("P", "Q", "R", "S")
 STATEMENT_QUESTION_PREFIX = "is this statement true"
 
 
+@dataclass(frozen=True)
+class StatementComplexity:
+    key: str
+    label: str
+    max_depth: int
+    variables: tuple[str, ...]
+    description: str
+
+
+STATEMENT_COMPLEXITY_LEVELS = (
+    StatementComplexity(
+        key="simple",
+        label="Simple",
+        max_depth=1,
+        variables=("P", "Q"),
+        description="short statements over two variables",
+    ),
+    StatementComplexity(
+        key="moderate",
+        label="Moderate",
+        max_depth=3,
+        variables=DEFAULT_VARIABLES,
+        description="nested statements with the default variable set",
+    ),
+    StatementComplexity(
+        key="complex",
+        label="Complex",
+        max_depth=5,
+        variables=("P", "Q", "R", "S", "U", "V"),
+        description="deeper statements with more variable variety",
+    ),
+)
+DEFAULT_STATEMENT_COMPLEXITY = "moderate"
+_COMPLEXITY_ALIASES = {
+    "easy": "simple",
+    "basic": "simple",
+    "medium": "moderate",
+    "normal": "moderate",
+    "hard": "complex",
+    "difficult": "complex",
+}
+
+
+def get_statement_complexity(level: str) -> StatementComplexity:
+    normalized = level.strip().lower()
+    normalized = _COMPLEXITY_ALIASES.get(normalized, normalized)
+
+    for option in STATEMENT_COMPLEXITY_LEVELS:
+        if option.key == normalized:
+            return option
+
+    valid = ", ".join(option.key for option in STATEMENT_COMPLEXITY_LEVELS)
+    raise ValueError(f"Unknown statement complexity {level!r}. Choose one of: {valid}")
+
+
+def _parse_complexity_key(raw: str) -> str:
+    try:
+        return get_statement_complexity(raw).key
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def statement_text_for_formula(formula: Formula) -> str:
     return f"{STATEMENT_QUESTION_PREFIX} {formula}"
 
@@ -333,21 +395,31 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate labeled propositional-logic statements.")
     parser.add_argument("n", type=int, help="Number of statements to generate.")
     parser.add_argument("output", type=Path, help="JSONL file to write.")
-    parser.add_argument("--max-depth", type=int, default=3)
+    parser.add_argument(
+        "--complexity",
+        type=_parse_complexity_key,
+        default=DEFAULT_STATEMENT_COMPLEXITY,
+        metavar="{simple,moderate,complex}",
+        help="Named complexity preset for generated statements.",
+    )
+    parser.add_argument("--max-depth", type=int, default=None, help="Override the preset formula depth.")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--true-fraction", type=float, default=0.5)
-    parser.add_argument("--variables", nargs="+", default=list(DEFAULT_VARIABLES))
+    parser.add_argument("--variables", nargs="+", default=None, help="Override the preset variable names.")
     parser.add_argument("--allow-duplicates", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    complexity = get_statement_complexity(args.complexity)
+    max_depth = args.max_depth if args.max_depth is not None else complexity.max_depth
+    variables = args.variables if args.variables is not None else complexity.variables
     statements = generate_and_save_labeled_statements(
         n=args.n,
         output_path=args.output,
-        max_depth=args.max_depth,
-        variables=args.variables,
+        max_depth=max_depth,
+        variables=variables,
         seed=args.seed,
         true_fraction=args.true_fraction,
         unique=not args.allow_duplicates,
@@ -356,6 +428,10 @@ def main() -> None:
     true_count = sum(1 for statement in statements if statement.label)
     false_count = len(statements) - true_count
     print(f"Wrote {len(statements)} statements to {args.output}")
+    print(
+        f"Complexity: {complexity.label.lower()} "
+        f"(max_depth={max_depth}, variables={', '.join(variables)})"
+    )
     print(f"True: {true_count}")
     print(f"False: {false_count}")
 

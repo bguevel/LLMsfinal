@@ -125,6 +125,14 @@ is_tautology(F) = all(eval(F, a) for a in assignments(vars(F)))
 
 `generate_and_save_labeled_statements(n, output_path, ...)` creates `n` labeled examples and writes them as JSONL.
 
+Statement generation supports named complexity presets:
+
+```text
+simple   = shorter formulas over P, Q
+moderate = default nested formulas over P, Q, R, S
+complex  = deeper formulas over P, Q, R, S, U, V
+```
+
 Each saved record includes:
 
 ```text
@@ -402,6 +410,7 @@ optional joint training of the selected AST encoder
 batched training
 plain text file training
 Wikipedia article training from a title/URL file
+mixed plain text plus Wikipedia training
 ```
 
 The custom model is flexible because its tokenizer, embeddings, attention blocks, and unembedding are all controlled in this repo.
@@ -424,7 +433,13 @@ Custom text training is also available. A plain text file trains the custom mode
 L_text = - sum_t log p(x_t | x_<t)
 ```
 
-Wikipedia training expects a text file containing one Wikipedia title or Wikipedia URL per line. The code fetches plaintext article extracts through the Wikipedia API, chunks the text into sequences, and trains the custom model in batches.
+Wikipedia training expects a text file containing one Wikipedia title or Wikipedia URL per line. The code fetches plaintext article extracts through the Wikipedia API, chunks the text into sequences, and trains the custom model in batches. A ready-to-use seed list with 500 titles is included at:
+
+```text
+data/wikipedia_titles_500.txt
+```
+
+The custom model menu lets you train from a plain text file, from the Wikipedia title list, or from both sources in one run. Each path prompts for the number of epochs before training starts.
 
 Example title file:
 
@@ -498,8 +513,10 @@ Even when the structural signal helps, a causal LM may output text other than ex
 Start with a generated dataset:
 
 ```powershell
-python statement_generation.py 200 data/generated_truth_eval.jsonl --seed 1 --max-depth 3
+python statement_generation.py 200 data/generated_truth_eval.jsonl --seed 1 --complexity moderate
 ```
+
+In the interactive menu, option 1 prompts for the statement complexity before writing the training or testing JSONL file. Use `Custom` if you want to enter a specific formula depth and variable list.
 
 Then compare:
 

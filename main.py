@@ -7,6 +7,7 @@ from custom_llm import (
     load_checkpoint as load_custom_llm_checkpoint,
     make_default_config,
     predict_truth_text,
+    train_custom_llm_on_text_and_wikipedia_files,
     train_custom_llm_on_text_file,
     train_custom_llm_on_wikipedia_file,
     train_on_labeled_statements_with_ast,
@@ -14,9 +15,13 @@ from custom_llm import (
 from dataset import make_dataset
 from search import bfs_proof_search, llm_topk_bfs
 from statement_generation import (
+    DEFAULT_VARIABLES,
     check_statement_truth,
+    DEFAULT_STATEMENT_COMPLEXITY,
     generate_and_save_labeled_statement_counts,
+    get_statement_complexity,
     load_labeled_statements,
+    STATEMENT_COMPLEXITY_LEVELS,
 )
 from tree_codec import load_tree_codec, train_tree_codec
 from tree_encoding import FormulaTreeEncoder, proof_state_to_tree_text
@@ -36,6 +41,7 @@ IMPORTED_WEIGHTS_DEFAULT = WEIGHTS_DIR / "imported_ast_adapter.pt"
 TRUTH_ENCODER_DEFAULT = WEIGHTS_DIR / "truth_embedding.pt"
 TREE_CODEC_DEFAULT = WEIGHTS_DIR / "tree_codec.pt"
 GENERATED_DATA_DEFAULT = DATA_DIR / "generated_truth_eval.jsonl"
+WIKIPEDIA_TITLES_DEFAULT = DATA_DIR / "wikipedia_titles_500.txt"
 
 
 def ask_int(prompt: str, default: int | None = None, minimum: int | None = None) -> int:
@@ -91,6 +97,63 @@ def ask_optional_path(prompt: str, default: Path | str | None = None) -> Path | 
     if raw.lower() in {"none", "new", "blank"}:
         return None
     return Path(raw)
+
+
+def ask_path_list(prompt: str) -> list[Path]:
+    raw = input(f"{prompt}> ").strip()
+    if not raw or raw.lower() in {"none", "skip"}:
+        return []
+    paths = [item.strip().strip('"') for item in raw.split(",")]
+    return [Path(item) for item in paths if item]
+
+
+def ask_variable_names(prompt: str, default: tuple[str, ...] = DEFAULT_VARIABLES) -> tuple[str, ...]:
+    while True:
+        raw = input(f"{prompt} [{' '.join(default)}]> ").strip()
+        variables = tuple(raw.split()) if raw else default
+        if variables:
+            return variables
+        print("[warn] Enter at least one variable name.")
+
+
+def choose_statement_complexity() -> tuple[str, int, tuple[str, ...]]:
+    default_complexity = get_statement_complexity(DEFAULT_STATEMENT_COMPLEXITY)
+    custom_index = len(STATEMENT_COMPLEXITY_LEVELS) + 1
+
+    while True:
+        print("\nStatement complexity")
+        for i, option in enumerate(STATEMENT_COMPLEXITY_LEVELS, start=1):
+            print(
+                f"{i}) {option.label}: {option.description} "
+                f"(depth={option.max_depth}, vars={', '.join(option.variables)})"
+            )
+        print(f"{custom_index}) Custom")
+
+        choice = input(f"select [{default_complexity.key}]> ").strip().lower()
+        if not choice:
+            option = default_complexity
+            return option.label, option.max_depth, option.variables
+
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(STATEMENT_COMPLEXITY_LEVELS):
+                option = STATEMENT_COMPLEXITY_LEVELS[index - 1]
+                return option.label, option.max_depth, option.variables
+            if index == custom_index:
+                max_depth = ask_int("Max random subformula depth", default=default_complexity.max_depth, minimum=0)
+                variables = ask_variable_names("Variable names")
+                return "Custom", max_depth, variables
+
+        if choice in {"custom", "c"}:
+            max_depth = ask_int("Max random subformula depth", default=default_complexity.max_depth, minimum=0)
+            variables = ask_variable_names("Variable names")
+            return "Custom", max_depth, variables
+
+        try:
+            option = get_statement_complexity(choice)
+            return option.label, option.max_depth, option.variables
+        except ValueError:
+            print("[warn] Choose a complexity number, name, or custom.")
 
 
 def choose_theorem():
@@ -158,8 +221,8 @@ def generate_statement_file_menu() -> None:
         print("[warn] Ask for at least one statement.")
         true_count = ask_int("How many true tautology statements should I generate?", default=50, minimum=0)
         false_count = ask_int("How many false non-tautology statements should I generate?", default=50, minimum=0)
-    output_path = ask_path("Training data JSONL filename", default=str(GENERATED_DATA_DEFAULT))
-    max_depth = ask_int("Max formula depth", default=3, minimum=0)
+    complexity_label, max_depth, variables = choose_statement_complexity()
+    output_path = ask_path("Training/testing data JSONL filename", default=str(GENERATED_DATA_DEFAULT))
     seed_raw = input("Seed (blank for random)> ").strip()
     seed = int(seed_raw) if seed_raw else None
 
@@ -168,12 +231,17 @@ def generate_statement_file_menu() -> None:
         false_count=false_count,
         output_path=output_path,
         max_depth=max_depth,
+        variables=variables,
         seed=seed,
     )
 
     true_count = sum(1 for item in statements if item.label)
     false_count = len(statements) - true_count
     print(f"[ok] Wrote {len(statements)} statements to {output_path}")
+    print(
+        f"     complexity={complexity_label.lower()}, max_depth={max_depth}, "
+        f"variables={', '.join(variables)}"
+    )
     print(f"     true={true_count}, false={false_count}")
 
 
@@ -341,6 +409,7 @@ def custom_llm_menu() -> None:
             print("3) Train custom model text-only, no AST baseline")
             print("4) Train custom model on a plain text file")
             print("5) Train custom model on Wikipedia articles from a title/URL file")
+            print("6) Train custom model on plain text plus Wikipedia articles")
             print("x) Back")
             choice = input("select> ").strip().lower()
 
@@ -430,7 +499,7 @@ def custom_llm_menu() -> None:
                 continue
 
             if choice == "5":
-                titles_path = ask_path("Wikipedia titles/URLs file")
+                titles_path = ask_path("Wikipedia titles/URLs file", default=str(WIKIPEDIA_TITLES_DEFAULT))
                 save_path = ask_path("Save custom Wikipedia-trained weights as", default=str(WEIGHTS_DIR / "custom_logic_llm_wikipedia.pt"))
                 epochs = ask_int("Epochs", default=3, minimum=1)
                 batch_size = ask_int("Batch size", default=8, minimum=1)
@@ -448,6 +517,36 @@ def custom_llm_menu() -> None:
                     min_chars=min_chars,
                 )
                 print(f"[ok] Saved custom Wikipedia-trained weights to {save_path}")
+                continue
+
+            if choice == "6":
+                text_paths = ask_path_list("Plain text training files, comma-separated (blank to skip)")
+                titles_path = ask_optional_path(
+                    "Wikipedia titles/URLs file (type 'none' to skip)",
+                    default=WIKIPEDIA_TITLES_DEFAULT,
+                )
+                if not text_paths and titles_path is None:
+                    print("[warn] Choose at least one plain text file or a Wikipedia titles file.")
+                    continue
+
+                save_path = ask_path("Save mixed text-trained weights as", default=str(WEIGHTS_DIR / "custom_logic_llm_mixed_text.pt"))
+                epochs = ask_int("Epochs", default=3, minimum=1)
+                batch_size = ask_int("Batch size", default=8, minimum=1)
+                seq_len = ask_int("Sequence length", default=128, minimum=1)
+                lr = ask_float("Learning rate", default=0.0005, minimum=0.0)
+                min_chars = ask_int("Minimum Wikipedia article characters", default=200, minimum=1)
+                train_custom_llm_on_text_and_wikipedia_files(
+                    model=model,
+                    text_paths=text_paths,
+                    titles_path=titles_path,
+                    epochs=epochs,
+                    lr=lr,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    save_path=save_path,
+                    min_chars=min_chars,
+                )
+                print(f"[ok] Saved mixed text-trained weights to {save_path}")
                 continue
 
             print("[warn] Invalid choice.")

@@ -243,6 +243,48 @@ def read_wikipedia_titles_file(path: str | Path) -> list[str]:
     return titles
 
 
+def read_plain_text_files(paths: Sequence[str | Path]) -> list[str]:
+    texts: list[str] = []
+    for path in paths:
+        text = Path(path).read_text(encoding="utf-8")
+        if text.strip():
+            texts.append(text)
+        else:
+            print(f"[warn] skipping {path}: file is empty")
+    return texts
+
+
+def collect_wikipedia_article_texts(
+    titles_path: str | Path,
+    min_chars: int = 200,
+    fetcher=None,
+) -> list[str]:
+    titles = read_wikipedia_titles_file(titles_path)
+    if not titles:
+        raise ValueError(f"No Wikipedia titles found in {titles_path}")
+
+    fetch = fetcher or fetch_wikipedia_article_text
+    texts: list[str] = []
+    for index, title in enumerate(titles, start=1):
+        print(f"[wiki {index}/{len(titles)}] fetching {title}")
+        try:
+            text = fetch(title)
+        except Exception as exc:
+            print(f"[warn] skipping {title}: {exc}")
+            continue
+
+        if len(text) < min_chars:
+            print(f"[warn] skipping {title}: article text too short")
+            continue
+
+        texts.append(f"Title: {title}\n{text}")
+
+    if not texts:
+        raise ValueError("No Wikipedia articles were fetched successfully")
+
+    return texts
+
+
 if nn is None:
 
     class AstConditionedTransformer:
@@ -723,10 +765,37 @@ def train_custom_llm_on_text_file(
     grad_clip: float | None = 1.0,
     save_path: str | Path | None = None,
 ) -> list[float]:
-    text = Path(text_path).read_text(encoding="utf-8")
+    return train_custom_llm_on_text_files(
+        model=model,
+        text_paths=[text_path],
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=device,
+        grad_clip=grad_clip,
+        save_path=save_path,
+    )
+
+
+def train_custom_llm_on_text_files(
+    model: AstConditionedTransformer,
+    text_paths: Sequence[str | Path],
+    epochs: int,
+    lr: float,
+    batch_size: int = 8,
+    seq_len: int = 128,
+    device: str | None = None,
+    grad_clip: float | None = 1.0,
+    save_path: str | Path | None = None,
+) -> list[float]:
+    texts = read_plain_text_files(text_paths)
+    if not texts:
+        raise ValueError("No plain text files contained trainable text")
+
     return train_custom_llm_on_texts(
         model=model,
-        texts=[text],
+        texts=texts,
         epochs=epochs,
         lr=lr,
         batch_size=batch_size,
@@ -749,27 +818,44 @@ def train_custom_llm_on_wikipedia_file(
     save_path: str | Path | None = None,
     min_chars: int = 200,
 ) -> list[float]:
-    titles = read_wikipedia_titles_file(titles_path)
-    if not titles:
-        raise ValueError(f"No Wikipedia titles found in {titles_path}")
+    texts = collect_wikipedia_article_texts(titles_path=titles_path, min_chars=min_chars)
 
+    return train_custom_llm_on_texts(
+        model=model,
+        texts=texts,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=device,
+        grad_clip=grad_clip,
+        save_path=save_path,
+    )
+
+
+def train_custom_llm_on_text_and_wikipedia_files(
+    model: AstConditionedTransformer,
+    text_paths: Sequence[str | Path] | None,
+    titles_path: str | Path | None,
+    epochs: int,
+    lr: float,
+    batch_size: int = 8,
+    seq_len: int = 128,
+    device: str | None = None,
+    grad_clip: float | None = 1.0,
+    save_path: str | Path | None = None,
+    min_chars: int = 200,
+) -> list[float]:
     texts: list[str] = []
-    for index, title in enumerate(titles, start=1):
-        print(f"[wiki {index}/{len(titles)}] fetching {title}")
-        try:
-            text = fetch_wikipedia_article_text(title)
-        except Exception as exc:
-            print(f"[warn] skipping {title}: {exc}")
-            continue
 
-        if len(text) < min_chars:
-            print(f"[warn] skipping {title}: article text too short")
-            continue
+    if text_paths:
+        texts.extend(read_plain_text_files(text_paths))
 
-        texts.append(f"Title: {title}\n{text}")
+    if titles_path is not None:
+        texts.extend(collect_wikipedia_article_texts(titles_path=titles_path, min_chars=min_chars))
 
     if not texts:
-        raise ValueError("No Wikipedia articles were fetched successfully")
+        raise ValueError("No trainable text was loaded from plain text files or Wikipedia")
 
     return train_custom_llm_on_texts(
         model=model,
