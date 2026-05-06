@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 
 from custom_llm import (
@@ -44,6 +45,30 @@ TREE_CODEC_DEFAULT = WEIGHTS_DIR / "tree_codec.pt"
 GENERATED_DATA_DEFAULT = DATA_DIR / "generated_truth_eval.jsonl"
 GENERATION_CONFIG_DEFAULT = DATA_DIR / "generations.txt"
 WIKIPEDIA_TITLES_DEFAULT = DATA_DIR / "wikipedia_titles_500.txt"
+
+
+def cleanup_after_training(stage_name: str) -> None:
+    print(f"[ok] Finished/left {stage_name}; releasing training resources.")
+    gc.collect()
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return
+    except Exception as exc:
+        print(f"[warn] Could not inspect torch cleanup state: {exc}")
+        return
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+    except Exception as exc:
+        print(f"[warn] Torch cleanup after {stage_name} had a warning: {exc}")
+
+
+def warn_training_error(stage_name: str, exc: Exception) -> None:
+    print(f"[warn] {stage_name} failed; continuing where possible: {type(exc).__name__}: {exc}")
 
 
 def ask_int(
@@ -262,6 +287,7 @@ def train_tree_embedding_menu() -> None:
     batch_size = ask_int("Batch size", default=16, minimum=1)
     lr = ask_float("Learning rate", default=0.001, minimum=0.0)
 
+    model = None
     try:
         model, _ = train_truth_embedding_model(
             statements=statements,
@@ -276,6 +302,11 @@ def train_tree_embedding_menu() -> None:
         print(f"Training-file accuracy: {metrics['correct']}/{metrics['total']} ({metrics['accuracy']:.2%})")
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
+    except Exception as exc:
+        warn_training_error("Truth-classifier AST embedding training", exc)
+    finally:
+        model = None
+        cleanup_after_training("truth-classifier AST embedding training")
 
 
 def train_tree_codec_menu() -> None:
@@ -289,8 +320,9 @@ def train_tree_codec_menu() -> None:
     batch_size = ask_int("Batch size", default=8, minimum=1)
     lr = ask_float("Learning rate", default=0.001, minimum=0.0)
 
+    model = None
     try:
-        train_tree_codec(
+        model, _ = train_tree_codec(
             statements=statements,
             dim=dim,
             epochs=epochs,
@@ -301,6 +333,11 @@ def train_tree_codec_menu() -> None:
         print(f"[ok] Saved trained tree codec to {save_path}")
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
+    except Exception as exc:
+        warn_training_error("AST embedding/unembedding codec training", exc)
+    finally:
+        model = None
+        cleanup_after_training("AST embedding/unembedding codec training")
 
 
 def evaluate_tree_embedding_menu() -> None:
@@ -409,11 +446,18 @@ def choose_tree_embedding_source():
 
 def train_custom_statement_model_menu() -> list | None:
     print("\n--- Train Custom Statement Model ---")
+    model = None
+    trained_encoder = None
+    selected_statements = None
     try:
         trained_encoder, tree_dim, source_name, use_ast = choose_tree_embedding_source()
         prefix_tokens = ask_int("Virtual AST prefix tokens", default=4, minimum=1) if use_ast else 1
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
+        return None
+    except Exception as exc:
+        warn_training_error("Custom statement model setup", exc)
+        cleanup_after_training("custom statement model setup")
         return None
 
     tokenizer_kind = "logic"
@@ -480,7 +524,14 @@ def train_custom_statement_model_menu() -> list | None:
         return selected_statements
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
-        return None
+        return selected_statements
+    except Exception as exc:
+        warn_training_error("Custom statement model training", exc)
+        return selected_statements
+    finally:
+        model = None
+        trained_encoder = None
+        cleanup_after_training("custom statement model training")
 
 
 def choose_imported_train_mode(use_ast: bool) -> str:
@@ -511,6 +562,9 @@ def choose_imported_train_mode(use_ast: bool) -> str:
 
 def train_imported_statement_model_menu() -> list | None:
     print("\n--- Train Imported Statement Model ---")
+    model = None
+    trained_encoder = None
+    selected_statements = None
     try:
         from imported_llm import (
             ImportedAstLLM,
@@ -522,6 +576,10 @@ def train_imported_statement_model_menu() -> list | None:
         prefix_tokens = ask_int("Virtual AST prefix tokens", default=4, minimum=1) if use_ast else 1
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
+        return None
+    except Exception as exc:
+        warn_training_error("Imported statement model setup", exc)
+        cleanup_after_training("imported statement model setup")
         return None
 
     default_model = "microsoft/Phi-3-mini-4k-instruct"
@@ -580,14 +638,21 @@ def train_imported_statement_model_menu() -> list | None:
             )
         except ValueError as exc:
             print(f"[warn] {exc}")
-            return None
+            return selected_statements
 
         label = "AST-conditioned" if use_ast else "regular-token-only"
         print(f"[ok] Saved {label} imported LLM checkpoint to {save_path}")
         return selected_statements
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
-        return None
+        return selected_statements
+    except Exception as exc:
+        warn_training_error("Imported statement model training", exc)
+        return selected_statements
+    finally:
+        model = None
+        trained_encoder = None
+        cleanup_after_training("imported statement model training")
 
 
 def train_both_embedding_models_on_statements(statements: list) -> None:
@@ -605,6 +670,7 @@ def train_both_embedding_models_on_statements(statements: list) -> None:
     codec_batch_size = ask_int("Codec batch size", default=8, minimum=1)
     lr = ask_float("Embedding learning rate", default=0.001, minimum=0.0)
 
+    truth_model = None
     try:
         truth_model, _ = train_truth_embedding_model(
             statements=statements,
@@ -620,10 +686,14 @@ def train_both_embedding_models_on_statements(statements: list) -> None:
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
     except Exception as exc:
-        print(f"[warn] Truth-classifier AST embedding training failed, continuing: {exc}")
+        warn_training_error("Truth-classifier AST embedding training", exc)
+    finally:
+        truth_model = None
+        cleanup_after_training("truth-classifier AST embedding training")
 
+    codec_model = None
     try:
-        train_tree_codec(
+        codec_model, _ = train_tree_codec(
             statements=statements,
             dim=dim,
             epochs=epochs,
@@ -635,18 +705,16 @@ def train_both_embedding_models_on_statements(statements: list) -> None:
     except ModuleNotFoundError as exc:
         print(f"[warn] {exc}")
     except Exception as exc:
-        print(f"[warn] AST embedding/unembedding codec training failed: {exc}")
+        warn_training_error("AST embedding/unembedding codec training", exc)
+    finally:
+        codec_model = None
+        cleanup_after_training("AST embedding/unembedding codec training")
 
 
 def train_statement_model_then_embeddings_menu() -> None:
-    print("\n--- Train Statement Model, Then Embeddings ---")
-    model_kind = choose_statement_model_kind()
-
-    selected_statements = None
-    if model_kind == "imported":
-        selected_statements = train_imported_statement_model_menu()
-    elif model_kind == "custom":
-        selected_statements = train_custom_statement_model_menu()
+    print("\n--- Train Custom Statement Model, Then AST Embeddings ---")
+    print("Order: custom statement model -> truth-classifier AST embedding -> AST codec encoder")
+    selected_statements = train_custom_statement_model_menu()
 
     if selected_statements:
         train_both_embedding_models_on_statements(selected_statements)
@@ -654,7 +722,7 @@ def train_statement_model_then_embeddings_menu() -> None:
 
 def train_statement_model_menu() -> None:
     print("\n--- Train Statement Model ---")
-    print("0) Train chosen statement model, then both standalone AST embedding models")
+    print("0) Train custom statement model, then truth classifier, then codec encoder")
     print("1) Imported HuggingFace model")
     print("2) Custom LLM3-style model")
     choice = input("select> ").strip().lower()
@@ -1009,7 +1077,7 @@ def main():
 
     while True:
         print("\n=== Logic Truth Evaluation Menu ===")
-        print("0) Train chosen statement model, then both standalone AST embedding models")
+        print("0) Train custom statement model, then truth classifier, then codec encoder")
         print("1) Generate true/false statements to a file")
         print("2) Check labels in a saved statement file")
         print("3) Train embedding models")
@@ -1022,22 +1090,28 @@ def main():
 
         if choice in {"q", "quit", "exit"}:
             break
-        if choice == "0":
-            train_statement_model_then_embeddings_menu()
-        elif choice == "1":
-            generate_statement_file_menu()
-        elif choice == "2":
-            check_statement_file_menu()
-        elif choice == "3":
-            train_embedding_models_menu()
-        elif choice == "4":
-            train_statement_model_menu()
-        elif choice == "5":
-            run_trained_model_file_menu()
-        elif choice == "6":
-            choose_llm_menu()
-        else:
-            print("[warn] Invalid choice.")
+        try:
+            if choice == "0":
+                train_statement_model_then_embeddings_menu()
+            elif choice == "1":
+                generate_statement_file_menu()
+            elif choice == "2":
+                check_statement_file_menu()
+            elif choice == "3":
+                train_embedding_models_menu()
+            elif choice == "4":
+                train_statement_model_menu()
+            elif choice == "5":
+                run_trained_model_file_menu()
+            elif choice == "6":
+                choose_llm_menu()
+            else:
+                print("[warn] Invalid choice.")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            warn_training_error("Menu action", exc)
+            cleanup_after_training("failed menu action")
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ python main.py
 Useful menu paths:
 
 ```text
-0) Train chosen statement model, then both standalone AST embedding models
+0) Train custom statement model, then truth classifier, then codec encoder
 1) Generate true/false statements to a file
 2) Check labels in a saved statement file
 3) Train embedding models
@@ -66,11 +66,13 @@ Useful menu paths:
 
 The project is now focused entirely on statement truth evaluation.
 
-Option 0 runs the full sequence: train the chosen statement model first, then train both standalone AST embedding models on the same selected JSONL lines.
+Option 0 runs the full sequence in a fixed order: train the custom statement model first, then train the truth-classifier AST embedding, then train the AST codec encoder on the same selected JSONL lines.
+
+Between phases, the menu releases training resources and clears CUDA cache when torch reports a CUDA device. Training errors are caught at phase boundaries so the overnight sequence can continue where possible instead of exiting the whole program.
 
 For option 4, the flow is intentionally direct: choose the model first, then choose the embedding source, then enter the training file, line count, epochs per line, learning rate, and save path. Option 6 keeps the fuller imported/custom model menus for running checkpoints and non-statement training paths.
 
-Inside option 4, option 0 provides the same combined training sequence.
+Inside option 4, option 0 provides the same combined custom-model training sequence.
 
 Model checkpoints are saved under:
 
