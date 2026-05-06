@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -32,6 +33,23 @@ class StatementComplexity:
     max_depth: int
     variables: tuple[str, ...]
     description: str
+
+
+@dataclass(frozen=True)
+class StatementGenerationBatch:
+    label: str
+    total_count: int
+    max_depth: int
+    variables: tuple[str, ...]
+    true_fraction: float = 0.5
+
+
+@dataclass(frozen=True)
+class StatementGenerationConfig:
+    statements_per_level: int
+    complexity_levels: int
+    variables: tuple[str, ...]
+    true_fraction: float = 0.5
 
 
 STATEMENT_COMPLEXITY_LEVELS = (
@@ -110,6 +128,114 @@ def check_statement_truth(formula: Formula) -> bool:
     tautologies. They may still be satisfiable under some assignments.
     """
     return is_tautology(formula)
+
+
+def split_label_counts(n: int, true_fraction: float = 0.5) -> tuple[int, int]:
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    if not 0.0 <= true_fraction <= 1.0:
+        raise ValueError("true_fraction must be between 0 and 1")
+
+    true_count = int((n * true_fraction) + 0.5)
+    false_count = n - true_count
+    return true_count, false_count
+
+
+def _parse_first_int(raw: str) -> int | None:
+    match = re.search(r"-?\d+", raw)
+    return int(match.group(0)) if match else None
+
+
+def _parse_first_float(raw: str) -> float | None:
+    match = re.search(r"-?\d+(?:\.\d+)?", raw)
+    return float(match.group(0)) if match else None
+
+
+def _parse_variable_set(raw: str) -> tuple[str, ...]:
+    cleaned = raw.replace("{", " ").replace("}", " ").replace(",", " ")
+    variables = tuple(item.strip() for item in cleaned.split() if item.strip())
+    if not variables:
+        raise ValueError("set of variables must contain at least one variable name")
+    return variables
+
+
+def parse_generation_config_text(text: str) -> StatementGenerationConfig:
+    statements_per_level: int | None = None
+    complexity_levels: int | None = None
+    variables: tuple[str, ...] | None = None
+    true_fraction = 0.5
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+
+        raw_key, raw_value = line.split(":", 1)
+        key = raw_key.strip().lower()
+        value = raw_value.strip()
+
+        if "variable" in key:
+            variables = _parse_variable_set(value)
+        elif "fraction" in key and "true" in key:
+            parsed_fraction = _parse_first_float(value)
+            if parsed_fraction is None:
+                raise ValueError(f"Could not parse true fraction from line: {line}")
+            true_fraction = parsed_fraction
+        elif "level" in key and "complex" in key:
+            parsed_levels = _parse_first_int(value)
+            if parsed_levels is None:
+                raise ValueError(f"Could not parse complexity level count from line: {line}")
+            complexity_levels = parsed_levels
+        elif "number" in key or "(n)" in key:
+            parsed_count = _parse_first_int(value)
+            if parsed_count is None:
+                raise ValueError(f"Could not parse statement count from line: {line}")
+            statements_per_level = parsed_count
+
+    if statements_per_level is None:
+        raise ValueError("Missing statement count line, for example: number of true and false (n): 500")
+    if complexity_levels is None:
+        raise ValueError(
+            "Missing complexity level line, for example: "
+            "levels of complexity (for each level n statements are generated): 10"
+        )
+    if variables is None:
+        raise ValueError("Missing variable set line, for example: set of variables: {P, Q, R}")
+    if statements_per_level < 1:
+        raise ValueError("statement count must be at least 1")
+    if complexity_levels < 1:
+        raise ValueError("complexity levels must be at least 1")
+    if not 0.0 <= true_fraction <= 1.0:
+        raise ValueError("true fraction must be between 0 and 1")
+
+    return StatementGenerationConfig(
+        statements_per_level=statements_per_level,
+        complexity_levels=complexity_levels,
+        variables=variables,
+        true_fraction=true_fraction,
+    )
+
+
+def load_generation_config(path: str | Path) -> StatementGenerationConfig:
+    config_path = Path(path)
+    return parse_generation_config_text(config_path.read_text(encoding="utf-8"))
+
+
+def statement_generation_batches_from_config(
+    config: StatementGenerationConfig,
+) -> list[StatementGenerationBatch]:
+    return [
+        StatementGenerationBatch(
+            label=f"Level {level}",
+            total_count=config.statements_per_level,
+            max_depth=level,
+            variables=config.variables,
+            true_fraction=config.true_fraction,
+        )
+        for level in range(1, config.complexity_levels + 1)
+    ]
 
 
 def verified_statement_label(formula: Formula, expected_label: bool, name: str = "<unnamed>") -> bool:
@@ -215,13 +341,7 @@ def generate_labeled_statements(
     true_fraction: float = 0.5,
     unique: bool = True,
 ) -> list[LabeledStatement]:
-    if n < 0:
-        raise ValueError("n must be non-negative")
-    if not 0.0 <= true_fraction <= 1.0:
-        raise ValueError("true_fraction must be between 0 and 1")
-
-    true_count = int((n * true_fraction) + 0.5)
-    false_count = n - true_count
+    true_count, false_count = split_label_counts(n, true_fraction)
     return generate_labeled_statement_counts(
         true_count=true_count,
         false_count=false_count,
@@ -239,6 +359,8 @@ def generate_labeled_statement_counts(
     variables: Sequence[str] = DEFAULT_VARIABLES,
     seed: int | None = None,
     unique: bool = True,
+    existing_seen: set[str] | None = None,
+    name_prefix: str = "",
 ) -> list[LabeledStatement]:
     if true_count < 0:
         raise ValueError("true_count must be non-negative")
@@ -251,7 +373,7 @@ def generate_labeled_statement_counts(
     rng.shuffle(targets)
 
     statements: list[LabeledStatement] = []
-    seen: set[str] = set()
+    seen = existing_seen if existing_seen is not None else set()
     attempts = 0
     max_attempts = max(1000, n * 200)
 
@@ -272,11 +394,12 @@ def generate_labeled_statement_counts(
         if unique and key in seen:
             continue
 
-        seen.add(key)
+        if unique:
+            seen.add(key)
         index = len(statements)
         statements.append(
             LabeledStatement(
-                name=f"{'true' if label else 'false'}_{index:04d}",
+                name=f"{name_prefix}{'true' if label else 'false'}_{index:04d}",
                 formula=formula,
                 label=label,
             )
@@ -286,6 +409,52 @@ def generate_labeled_statement_counts(
     if targets:
         raise RuntimeError(f"Generated {len(statements)} statements but needed {n}")
 
+    return statements
+
+
+def _statement_name_fragment(raw: str) -> str:
+    fragment = "".join(ch.lower() if ch.isalnum() else "_" for ch in raw.strip())
+    while "__" in fragment:
+        fragment = fragment.replace("__", "_")
+    return fragment.strip("_") or "level"
+
+
+def generate_labeled_statement_batches(
+    batches: Sequence[StatementGenerationBatch],
+    seed: int | None = None,
+    unique: bool = True,
+) -> list[LabeledStatement]:
+    if not batches:
+        raise ValueError("batches must contain at least one complexity level")
+
+    rng = random.Random(seed)
+    seen: set[str] | None = set() if unique else None
+    statements: list[LabeledStatement] = []
+
+    for batch_index, batch in enumerate(batches, start=1):
+        true_count, false_count = split_label_counts(batch.total_count, batch.true_fraction)
+        if not batch.variables:
+            raise ValueError("variables must contain at least one variable name")
+
+        if true_count + false_count == 0:
+            continue
+
+        batch_seed = rng.randrange(0, 2**32)
+        name_prefix = f"{_statement_name_fragment(batch.label)}_{batch_index:02d}_"
+        statements.extend(
+            generate_labeled_statement_counts(
+                true_count=true_count,
+                false_count=false_count,
+                max_depth=batch.max_depth,
+                variables=batch.variables,
+                seed=batch_seed,
+                unique=unique,
+                existing_seen=seen,
+                name_prefix=name_prefix,
+            )
+        )
+
+    rng.shuffle(statements)
     return statements
 
 
@@ -302,14 +471,20 @@ def statement_to_record(statement: LabeledStatement) -> dict:
     }
 
 
-def record_to_statement(record: dict) -> LabeledStatement:
+def record_to_statement(record: dict, verify_label: bool = True) -> LabeledStatement:
     formula = formula_from_dict(record["formula"])
     label = bool(record["label"])
-    actual_label = verified_statement_label(formula, label, str(record.get("name", "<unnamed>")))
-    if "is_tautology" in record and bool(record["is_tautology"]) != actual_label:
+    if verify_label:
+        actual_label = verified_statement_label(formula, label, str(record.get("name", "<unnamed>")))
+        if "is_tautology" in record and bool(record["is_tautology"]) != actual_label:
+            raise ValueError(
+                f"Stored tautology metadata mismatch for {record.get('name', '<unnamed>')}: "
+                f"expected {actual_label}, got {record['is_tautology']}"
+            )
+    elif "is_tautology" in record and bool(record["is_tautology"]) != label:
         raise ValueError(
-            f"Stored tautology metadata mismatch for {record.get('name', '<unnamed>')}: "
-            f"expected {actual_label}, got {record['is_tautology']}"
+            f"Stored label metadata mismatch for {record.get('name', '<unnamed>')}: "
+            f"label={label}, is_tautology={record['is_tautology']}"
         )
 
     return LabeledStatement(
@@ -332,17 +507,41 @@ def save_labeled_statements(statements: Iterable[LabeledStatement], output_path:
     return path
 
 
-def load_labeled_statements(input_path: str | Path) -> list[LabeledStatement]:
+def load_labeled_statements(input_path: str | Path, verify_labels: bool = True) -> list[LabeledStatement]:
     path = Path(input_path)
     statements: list[LabeledStatement] = []
 
     with path.open("r", encoding="utf-8") as f:
+        first = ""
+        while True:
+            char = f.read(1)
+            if not char:
+                return []
+            if not char.isspace():
+                first = char
+                break
+        f.seek(0)
+
+        if first == "[":
+            try:
+                records = json.load(f)
+            except Exception as exc:
+                raise ValueError(f"Could not read JSON statement array from {path}") from exc
+            if not isinstance(records, list):
+                raise ValueError(f"Expected a JSON array of statement records in {path}")
+            for index, record in enumerate(records, start=1):
+                try:
+                    statements.append(record_to_statement(record, verify_label=verify_labels))
+                except Exception as exc:
+                    raise ValueError(f"Could not read statement array item {index}") from exc
+            return statements
+
         for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                statements.append(record_to_statement(json.loads(line)))
+                statements.append(record_to_statement(json.loads(line), verify_label=verify_labels))
             except Exception as exc:
                 raise ValueError(f"Could not read statement on line {line_number}") from exc
 
@@ -384,6 +583,21 @@ def generate_and_save_labeled_statement_counts(
         false_count=false_count,
         max_depth=max_depth,
         variables=variables,
+        seed=seed,
+        unique=unique,
+    )
+    save_labeled_statements(statements, output_path)
+    return statements
+
+
+def generate_and_save_labeled_statement_batches(
+    batches: Sequence[StatementGenerationBatch],
+    output_path: str | Path,
+    seed: int | None = None,
+    unique: bool = True,
+) -> list[LabeledStatement]:
+    statements = generate_labeled_statement_batches(
+        batches=batches,
         seed=seed,
         unique=unique,
     )

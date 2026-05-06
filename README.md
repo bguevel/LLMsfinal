@@ -35,7 +35,7 @@ The immediate experiments are designed to test whether explicit AST structure im
 The main comparisons are:
 
 ```text
-1) Custom model, logic-aware tokenizer, no AST baseline.
+1) Custom model, logic-aware tokenizer, regular token embeddings only.
 2) Custom model, logic-aware tokenizer, hash AST.
 3) Custom model, logic-aware tokenizer, trained AST encoder.
 4) Imported model with prompt/tree text only as a baseline.
@@ -57,14 +57,17 @@ Useful menu paths:
 ```text
 1) Generate true/false statements to a file
 2) Check labels in a saved statement file
-3) Train the AST embedding truth model
-4) Train the AST embedding/unembedding codec
-5) Use the trained AST embedding truth model
-6) Choose imported or custom LLM
-7) Optional proof-search BFS mode
+3) Train embedding models
+4) Train statement model
+5) Run a trained model on a statement file
+6) Advanced imported/custom LLM menu
 ```
 
-The main research path is statement truth evaluation. The proof-search BFS code remains available, but it is no longer the default project direction.
+The project is now focused entirely on statement truth evaluation.
+
+For option 4, the flow is intentionally direct: choose the model first, then choose the embedding source, then enter the training file, line count, epochs per line, learning rate, and save path. Option 6 keeps the fuller imported/custom model menus for running checkpoints and non-statement training paths.
+
+Inside option 4, option 0 runs the full sequence: train the chosen statement model first, then train both standalone AST embedding models on the same selected JSONL lines.
 
 Model checkpoints are saved under:
 
@@ -124,6 +127,32 @@ is_tautology(F) = all(eval(F, a) for a in assignments(vars(F)))
 `generate_labeled_statements(n, ...)` creates `n` labeled examples in memory.
 
 `generate_and_save_labeled_statements(n, output_path, ...)` creates `n` labeled examples and writes them as JSONL.
+
+`generate_and_save_labeled_statement_batches(...)` writes one JSONL file from several complexity levels, each with its own statement count.
+
+The interactive generator reads its default generation plan from:
+
+```text
+data/generations.txt
+```
+
+Expected format:
+
+```text
+number of true and false (n): 500
+levels of complexity (for each level n statements are generated): 10
+set of variables: {Q, W, E, R, T, Y, U, I, O, P}
+```
+
+This creates levels 1 through 10, using each level number as the random formula max depth, and generates `n` total statements at each level.
+
+During generation, each candidate formula is evaluated with the symbolic tautology checker before it is accepted for its assigned true/false label. The saved JSONL also stores `is_tautology` metadata. Training paths then trust that generated label metadata instead of recomputing symbolic truth for every example.
+
+You can optionally add:
+
+```text
+true fraction: 0.5
+```
 
 Statement generation supports named complexity presets:
 
@@ -252,6 +281,8 @@ becomes:
 This helps the text channel and AST channel agree about structure.
 
 The custom model can choose either tokenizer in `main.py`.
+
+For the project's main custom-model training path, `main.py` now uses the logic-aware tokenizer by default so the tokenizer is not the experimental variable.
 
 ### Imported Model Tokenizer
 
@@ -394,6 +425,8 @@ model input = concat(structural prefix, regular token stream)
 
 For the no-AST baseline, the structural prefix is omitted.
 
+In the custom model menu, the "regular token embeddings only" option trains on the labeled statement JSONL with the same true/false answer objective, but passes `use_ast=False`. That means the model uses token embeddings plus position embeddings, without a parallel AST soft-prefix.
+
 ## Custom LLM Path
 
 `custom_llm.py` adapts the user's LLM3-style Transformer.
@@ -426,6 +459,10 @@ final unembedding
 AST projector, when AST is enabled
 selected trainable AST encoder, if joint training is selected
 ```
+
+The labeled-statement training menu asks how many JSONL lines to train on and how many epochs to run per line. Press Enter at the line-count prompt to use the full file. For this path, an epoch means one optimizer update on the current line. Training uses one JSONL line at a time, repeats that same line for the requested epochs, then moves to the next line. Oversized or failed lines are skipped with a warning so training can continue. Progress prints every 50 line-epochs, plus once at the end.
+
+For true/false statement data, the loss is applied to the answer token only (`true` or `false`, represented as `<TRUE>` or `<FALSE>` by the logic-aware tokenizer). The model input contains the formula prompt and optional AST prefix, but not the statement name, saved JSON label, or answer token.
 
 Custom text training is also available. A plain text file trains the custom model with a next-token objective:
 
@@ -516,7 +553,7 @@ Start with a generated dataset:
 python statement_generation.py 200 data/generated_truth_eval.jsonl --seed 1 --complexity moderate
 ```
 
-In the interactive menu, option 1 prompts for the statement complexity before writing the training or testing JSONL file. Use `Custom` if you want to enter a specific formula depth and variable list.
+In the interactive menu, option 1 reads `data/generations.txt`, then prompts only for the output JSONL file and optional random seed.
 
 Then compare:
 

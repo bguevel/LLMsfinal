@@ -3,11 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from custom_llm import (
+    LogicAwareTokenizer,
     collect_wikipedia_article_texts,
+    logic_formula_prompt,
     read_plain_text_files,
     read_wikipedia_titles_file,
+    statement_prompt,
     wikipedia_title_from_line,
 )
+from logic import Imp, Var
+from statement_generation import LabeledStatement
 
 
 def test_default_wikipedia_title_file_has_500_unique_titles() -> None:
@@ -65,9 +70,49 @@ def test_wikipedia_collection_can_use_fake_fetcher() -> None:
         titles_path.unlink(missing_ok=True)
 
 
+def test_statement_prompt_can_use_symbolic_label_override() -> None:
+    statement = LabeledStatement(
+        name="bad_saved_label",
+        formula=Imp(Var("P"), Var("P")),
+        label=False,
+    )
+
+    prompt = statement_prompt(statement, include_label=True, label_override=True)
+
+    assert prompt.endswith("Answer: true")
+
+
+def test_statement_prompt_without_label_hides_saved_label_metadata() -> None:
+    statement = LabeledStatement(
+        name="true_looks_like_label",
+        formula=Imp(Var("P"), Var("P")),
+        label=True,
+    )
+
+    prompt = statement_prompt(statement, include_label=False).lower()
+
+    assert "true" not in prompt
+    assert "false" not in prompt
+    assert statement.name not in prompt
+
+
+def test_logic_formula_prompt_tokenizes_formula_once() -> None:
+    tokenizer = LogicAwareTokenizer()
+    tokens = tokenizer.normalize(logic_formula_prompt(Imp(Var("P"), Var("Q"))))
+
+    assert "VAR_P" in tokens
+    assert "VAR_Q" in tokens
+    assert "VAR_VAR_P" not in tokens
+    assert "<TRUE>" not in tokens
+    assert "<FALSE>" not in tokens
+
+
 if __name__ == "__main__":
     test_default_wikipedia_title_file_has_500_unique_titles()
     test_wikipedia_title_lines_accept_titles_and_urls()
     test_plain_text_file_reader_skips_empty_files()
     test_wikipedia_collection_can_use_fake_fetcher()
+    test_statement_prompt_can_use_symbolic_label_override()
+    test_statement_prompt_without_label_hides_saved_label_metadata()
+    test_logic_formula_prompt_tokenizes_formula_once()
     print("text training source checks passed")

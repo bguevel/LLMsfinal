@@ -13,7 +13,6 @@ except ModuleNotFoundError:
     nn = None
 
 from logic import And, Formula, Imp, Or, Var
-from state import Goal, ProofState
 
 
 NODE_KINDS = ("var", "and", "or", "imp")
@@ -335,29 +334,6 @@ def formula_to_tree_record(formula: Formula) -> dict:
     }
 
 
-def proof_state_to_tree_json(state: ProofState) -> dict:
-    if state.is_solved():
-        return {
-            "status": "solved",
-            "goals": [],
-        }
-
-    return {
-        "status": "unsolved",
-        "goals": [
-            {
-                "assumptions": [formula_to_tree_record(assumption) for assumption in goal.assumptions],
-                "target": formula_to_tree_record(goal.target),
-            }
-            for goal in state.goals
-        ],
-    }
-
-
-def proof_state_to_tree_text(state: ProofState) -> str:
-    return json.dumps(proof_state_to_tree_json(state), indent=2)
-
-
 def _stable_hash_int(text: str) -> int:
     digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big", signed=False)
@@ -372,7 +348,7 @@ def _l2_normalize(vec: torch.Tensor) -> torch.Tensor:
 
 class HashingTreeEmbedder:
     """
-    Fixed structural embedding for formulas/proof states.
+    Fixed structural embedding for formulas.
 
     This is useful before training because it does not introduce random weights.
     Features include node kinds at paths, variable names at paths, operator edges,
@@ -424,31 +400,6 @@ class HashingTreeEmbedder:
             self._add(vec, feature, weight)
         return _l2_normalize(vec)
 
-    def encode_goal(self, goal: Goal) -> torch.Tensor:
-        vec = torch.zeros(self.dim, dtype=torch.float32)
-        for feature, weight in self._formula_features(goal.target, "target"):
-            self._add(vec, feature, weight)
-
-        for assumption in goal.assumptions:
-            for feature, weight in self._formula_features(assumption, "assumption"):
-                self._add(vec, feature, weight)
-
-        self._add(vec, f"goal:assumption_count:{len(goal.assumptions)}", float(len(goal.assumptions)))
-        return _l2_normalize(vec)
-
-    def encode_state(self, state: ProofState) -> torch.Tensor:
-        vec = torch.zeros(self.dim, dtype=torch.float32)
-        if state.is_solved():
-            self._add(vec, "state:solved")
-            return _l2_normalize(vec)
-
-        for goal_index, goal in enumerate(state.goals):
-            goal_vec = self.encode_goal(goal)
-            vec += goal_vec / float(goal_index + 1)
-
-        self._add(vec, f"state:goal_count:{len(state.goals)}", float(len(state.goals)))
-        return _l2_normalize(vec)
-
 
 if nn is None:
 
@@ -478,8 +429,6 @@ else:
             self.var_embedding = nn.Embedding(var_buckets, dim)
             self.leaf = nn.Linear(dim * 2, dim)
             self.binary = nn.Linear(dim * 3, dim)
-            self.role_embedding = nn.Embedding(2, dim)
-            self.state_projection = nn.Linear(dim, dim)
 
         def _kind_tensor(self, kind: str, device: torch.device) -> torch.Tensor:
             return torch.tensor(self.kind_to_index[kind], dtype=torch.long, device=device)
@@ -502,25 +451,3 @@ else:
             left_vec = self.encode_formula(formula.left, device=device)
             right_vec = self.encode_formula(formula.right, device=device)
             return torch.tanh(self.binary(torch.cat([kind_vec, left_vec, right_vec], dim=-1)))
-
-        def encode_goal(self, goal: Goal, device: torch.device | None = None) -> torch.Tensor:
-            if device is None:
-                device = self.kind_embedding.weight.device
-
-            target_role = self.role_embedding(torch.tensor(0, dtype=torch.long, device=device))
-            assumption_role = self.role_embedding(torch.tensor(1, dtype=torch.long, device=device))
-
-            pieces = [self.encode_formula(goal.target, device=device) + target_role]
-            pieces.extend(self.encode_formula(assumption, device=device) + assumption_role for assumption in goal.assumptions)
-
-            return torch.stack(pieces).mean(dim=0)
-
-        def encode_state(self, state: ProofState, device: torch.device | None = None) -> torch.Tensor:
-            if device is None:
-                device = self.kind_embedding.weight.device
-
-            if state.is_solved():
-                return torch.zeros(self.dim, device=device)
-
-            goal_vecs = [self.encode_goal(goal, device=device) for goal in state.goals]
-            return torch.tanh(self.state_projection(torch.stack(goal_vecs).mean(dim=0)))

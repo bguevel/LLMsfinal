@@ -212,6 +212,8 @@ def train_imported_ast_llm(
     _require_deps()
     if not statements:
         raise ValueError("statements must not be empty")
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     if not use_ast and train_mode == "adapter_only":
@@ -238,56 +240,83 @@ def train_imported_ast_llm(
 
     optimizer = torch.optim.AdamW(params, lr=lr)
     losses: list[float] = []
+    total_updates = len(statements) * epochs
+    update_index = 0
+    skipped_updates = 0
+    last_line_index = 0
+    last_epoch_index = 0
+    last_loss = 0.0
 
-    for epoch in range(epochs):
-        total_loss = 0.0
-        total_items = 0
+    for line_index, statement in enumerate(statements, start=1):
+        prompt = (
+            logic_formula_prompt(statement.formula)
+            if model.tokenizer_mode == "augmented_logic"
+            else statement_prompt(statement, include_label=False)
+        )
+        answer = f" {'true' if statement.label else 'false'}"
 
-        for start in range(0, len(statements), batch_size):
-            batch = statements[start:start + batch_size]
-            prompts = [
-                logic_formula_prompt(statement.formula)
-                if model.tokenizer_mode == "augmented_logic"
-                else statement_prompt(statement, include_label=False)
-                for statement in batch
-            ]
-            answers = [f" {'true' if statement.label else 'false'}" for statement in batch]
-            input_ids, attention_mask, labels = _training_batch_tensors(model.tokenizer, prompts, answers, model.device)
-            tree_vec = None
-            if use_ast:
-                tree_vec = torch.stack(
-                    [
-                        tree_embedding_for_formula(
-                            statement.formula,
-                            dim=tree_embedding_dim,
-                            device=str(model.device),
-                            trained_encoder=trained_encoder,
-                        )
-                        for statement in batch
-                    ]
+        for epoch_index in range(1, epochs + 1):
+            try:
+                input_ids, attention_mask, labels = _training_batch_tensors(
+                    model.tokenizer,
+                    [prompt],
+                    [answer],
+                    model.device,
                 )
+                tree_vec = None
+                if use_ast:
+                    tree_vec = tree_embedding_for_formula(
+                        statement.formula,
+                        dim=tree_embedding_dim,
+                        device=str(model.device),
+                        trained_encoder=trained_encoder,
+                    ).unsqueeze(0)
 
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                tree_embedding=tree_vec,
-                labels=labels,
-            )
-            loss = outputs.loss
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    tree_embedding=tree_vec,
+                    labels=labels,
+                )
+                loss = outputs.loss
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
 
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(params, grad_clip)
 
-            optimizer.step()
-            total_loss += loss.item() * len(batch)
-            total_items += len(batch)
+                optimizer.step()
+                update_index += 1
+                last_line_index = line_index
+                last_epoch_index = epoch_index
+                last_loss = loss.item()
+                losses.append(last_loss)
 
-        avg_loss = total_loss / max(1, total_items)
-        losses.append(avg_loss)
-        print(f"epoch {epoch + 1}/{epochs} | imported AST LLM loss {avg_loss:.4f}")
+                should_print = update_index % 50 == 0 or update_index == total_updates
+                if should_print:
+                    print(
+                        f"line {line_index}/{len(statements)} | epoch {epoch_index}/{epochs} | "
+                        f"update {update_index}/{total_updates} | imported AST LLM loss {last_loss:.4f}"
+                    )
+            except (ValueError, RuntimeError) as exc:
+                skipped_updates += 1
+                print(
+                    f"[warn] Skipping line {line_index}/{len(statements)} epoch {epoch_index}/{epochs}: {exc}"
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                break
+
+    if skipped_updates:
+        print(f"[warn] Skipped {skipped_updates} failed imported-model line-epochs.")
+    if not losses:
+        print("[warn] No imported statement training updates completed.")
+    elif update_index % 50 != 0 and update_index != total_updates:
+        print(
+            f"line {last_line_index}/{len(statements)} | epoch {last_epoch_index}/{epochs} | "
+            f"completed updates {update_index}/{total_updates} | imported AST LLM loss {last_loss:.4f}"
+        )
 
     if save_path is not None:
         save_imported_ast_checkpoint(model, save_path, save_base_weights=save_base_weights)

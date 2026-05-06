@@ -106,7 +106,9 @@ def train_truth_embedding_model(
 
         avg_loss = total_loss / max(1, total_items)
         losses.append(avg_loss)
-        print(f"epoch {epoch + 1}/{epochs} | truth embedding loss {avg_loss:.4f}")
+        epoch_number = epoch + 1
+        if epoch_number % 50 == 0 or epoch_number == epochs:
+            print(f"epoch {epoch_number}/{epochs} | truth embedding loss {avg_loss:.4f}")
 
     if save_path is not None:
         save_truth_embedding_model(model, save_path)

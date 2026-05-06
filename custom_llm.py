@@ -27,7 +27,7 @@ except ModuleNotFoundError:
     F = None
 
 from logic import Formula
-from statement_generation import LabeledStatement, statement_text_for_formula
+from statement_generation import LabeledStatement
 from tree_encoding import FormulaTreeEncoder, HashingTreeEmbedder
 
 
@@ -181,8 +181,8 @@ def logic_token_text(text: str) -> str:
 def logic_formula_prompt(formula: Formula) -> str:
     return (
         "<STATEMENT>\n"
-        f"{logic_token_text(statement_text_for_formula(formula))}\n"
-        "<QUESTION> true under every truth assignment ?\n"
+        f"{formula}\n"
+        "<QUESTION> tautology ?\n"
         "<ANSWER>:"
     )
 
@@ -473,25 +473,36 @@ def make_custom_logic_llm(
     return AstConditionedTransformer(config, tokenizer)
 
 
-def statement_prompt(statement: LabeledStatement, include_label: bool = True) -> str:
+def statement_prompt(
+    statement: LabeledStatement,
+    include_label: bool = True,
+    label_override: bool | None = None,
+) -> str:
     prompt = (
-        "Statement:\n"
-        f"{statement.text}\n"
-        "Question: Is it true under every truth assignment?\n"
+        "Formula:\n"
+        f"{statement.formula}\n"
+        "Question: tautology?\n"
         "Answer:"
     )
     if include_label:
-        prompt += f" {'true' if statement.label else 'false'}"
+        label = statement.label if label_override is None else label_override
+        prompt += f" {'true' if label else 'false'}"
     return prompt
 
 
 def formula_prompt(formula: Formula) -> str:
     return (
-        "Statement:\n"
-        f"{statement_text_for_formula(formula)}\n"
-        "Question: Is it true under every truth assignment?\n"
+        "Formula:\n"
+        f"{formula}\n"
+        "Question: tautology?\n"
         "Answer:"
     )
+
+
+def training_prompt_for_statement(model: AstConditionedTransformer, statement: LabeledStatement) -> str:
+    if getattr(model.tokenizer, "tokenizer_kind", "word") == "logic":
+        return logic_formula_prompt(statement.formula)
+    return statement_prompt(statement, include_label=False)
 
 
 def _hash_tree_embedding(formula: Formula, dim: int, device: str) -> torch.Tensor:
@@ -541,6 +552,55 @@ def _pad_next_token_batch(
         length = len(x_ids)
         x[row, :length] = torch.tensor(x_ids, dtype=torch.long, device=device)
         y[row, :length] = torch.tensor(y_ids, dtype=torch.long, device=device)
+
+    return x, y
+
+
+def _pad_answer_only_batch(
+    prompt_token_lists: Sequence[Sequence[int]],
+    answer_token_lists: Sequence[Sequence[int]],
+    pad_id: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if len(prompt_token_lists) != len(answer_token_lists):
+        raise ValueError("prompt and answer batches must have the same length")
+
+    rows: list[tuple[list[int], int, int]] = []
+    for prompt_ids, answer_ids in zip(prompt_token_lists, answer_token_lists):
+        prompt = list(prompt_ids)
+        answer = list(answer_ids)
+        if not prompt:
+            raise ValueError("Prompt token list must not be empty")
+        if not answer:
+            raise ValueError("Answer token list must not be empty")
+        if len(answer) != 1:
+            raise ValueError(
+                "Labeled-statement answers must tokenize to exactly one token "
+                "so the model cannot see any part of the label in its input."
+            )
+
+        full_ids = prompt + answer
+        if len(full_ids) < 2:
+            raise ValueError("Batch has no sequences with at least two tokens")
+        rows.append((full_ids, len(prompt), len(answer)))
+
+    max_len = max(len(full_ids) - 1 for full_ids, _, _ in rows)
+    x = torch.full((len(rows), max_len), pad_id, dtype=torch.long, device=device)
+    y = torch.full((len(rows), max_len), -100, dtype=torch.long, device=device)
+
+    for row, (full_ids, prompt_len, answer_len) in enumerate(rows):
+        x_ids = full_ids[:-1]
+        y_ids = full_ids[1:]
+        length = len(x_ids)
+        x[row, :length] = torch.tensor(x_ids, dtype=torch.long, device=device)
+
+        answer_start = prompt_len - 1
+        answer_end = answer_start + answer_len
+        y[row, answer_start:answer_end] = torch.tensor(
+            y_ids[answer_start:answer_end],
+            dtype=torch.long,
+            device=device,
+        )
 
     return x, y
 
@@ -598,10 +658,22 @@ def train_on_labeled_statements_with_ast(
     train_tree_encoder: bool = False,
     use_ast: bool = True,
     save_path: str | Path | None = None,
+    progress_interval_epochs: int = 50,
 ) -> list[float]:
+    """
+    Train on labeled statement records.
+
+    For this project's labeled JSONL data, ``epochs`` means repeated training
+    iterations on one JSONL line before moving to the next line. Each optimizer
+    update sees exactly one statement record.
+    """
     _require_torch()
     if not statements:
         raise ValueError("statements must not be empty")
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
+    if progress_interval_epochs < 1:
+        raise ValueError("progress_interval_epochs must be at least 1")
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -611,9 +683,14 @@ def train_on_labeled_statements_with_ast(
         for param in trained_encoder.parameters():
             param.requires_grad = train_tree_encoder
 
-    texts = [statement_prompt(statement, include_label=True) for statement in statements]
-    for text in texts:
-        model.tokenizer.add_text(text)
+    prompts = [training_prompt_for_statement(model, statement) for statement in statements]
+    answers = [
+        f" {'true' if statement.label else 'false'}"
+        for statement in statements
+    ]
+    for prompt, answer in zip(prompts, answers):
+        model.tokenizer.add_text(prompt)
+        model.tokenizer.add_text(answer)
     pad_id = model.tokenizer.pad_id
     model.resize_vocab(model.tokenizer.vocab_size)
 
@@ -623,48 +700,91 @@ def train_on_labeled_statements_with_ast(
 
     optimizer = torch.optim.AdamW(params, lr=lr)
     losses: list[float] = []
+    samples = list(zip(statements, prompts, answers))
+    update_index = 0
+    total_updates = len(samples) * epochs
+    skipped_lines = 0
+    skipped_updates = 0
+    last_line_index = 0
+    last_epoch_index = 0
+    last_loss = 0.0
 
-    for epoch in range(epochs):
-        total_loss = 0.0
-        total_items = 0
+    for line_index, (statement, prompt, answer) in enumerate(samples, start=1):
+        encoded_prompt = model.tokenizer.encode(prompt)
+        encoded_answer = model.tokenizer.encode(answer)
+        input_tokens = len(encoded_prompt) + len(encoded_answer) - 1
+        extra_tokens = model.config.tree_prefix_tokens if use_ast else 0
+        total_tokens = input_tokens + extra_tokens
+        if total_tokens > model.config.max_seq_len:
+            skipped_lines += 1
+            print(
+                f"[warn] Skipping line {line_index}/{len(samples)}: "
+                f"tokenized length {total_tokens} exceeds max_seq_len={model.config.max_seq_len}"
+            )
+            continue
 
-        for batch in _iter_batches(list(zip(statements, texts)), batch_size):
-            batch_statements = [item[0] for item in batch]
-            batch_texts = [item[1] for item in batch]
-            encoded = [model.tokenizer.encode(text) for text in batch_texts]
-            x, y = _pad_next_token_batch(encoded, pad_id=pad_id, device=device)
-
-            tree_vec = None
-            if use_ast:
-                tree_vec = torch.stack(
-                    [
-                        tree_embedding_for_formula(
-                            statement.formula,
-                            dim=model.config.tree_embedding_dim,
-                            device=device,
-                            trained_encoder=trained_encoder,
-                        )
-                        for statement in batch_statements
-                    ]
+        for epoch_index in range(1, epochs + 1):
+            try:
+                x, y = _pad_answer_only_batch(
+                    [encoded_prompt],
+                    [encoded_answer],
+                    pad_id=pad_id,
+                    device=device,
                 )
 
-            logits = model(x, tree_embedding=tree_vec)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
+                tree_vec = None
+                if use_ast:
+                    tree_vec = tree_embedding_for_formula(
+                        statement.formula,
+                        dim=model.config.tree_embedding_dim,
+                        device=device,
+                        trained_encoder=trained_encoder,
+                    ).unsqueeze(0)
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+                logits = model(x, tree_embedding=tree_vec)
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
 
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(params, grad_clip)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
 
-            optimizer.step()
-            total_loss += loss.item() * len(batch_statements)
-            total_items += len(batch_statements)
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(params, grad_clip)
 
-        avg_loss = total_loss / max(1, total_items)
-        losses.append(avg_loss)
-        label = "AST-conditioned LLM" if use_ast else "text-only custom LLM"
-        print(f"epoch {epoch + 1}/{epochs} | {label} loss {avg_loss:.4f}")
+                optimizer.step()
+                update_index += 1
+                last_line_index = line_index
+                last_epoch_index = epoch_index
+                last_loss = loss.item()
+                losses.append(last_loss)
+
+                should_print = update_index % progress_interval_epochs == 0 or update_index == total_updates
+                if should_print:
+                    label = "AST-conditioned LLM" if use_ast else "regular-token-only custom LLM"
+                    print(
+                        f"line {line_index}/{len(samples)} | epoch {epoch_index}/{epochs} | "
+                        f"update {update_index}/{total_updates} | "
+                        f"{label} true/false answer loss {last_loss:.4f}"
+                    )
+            except (ValueError, RuntimeError) as exc:
+                skipped_updates += 1
+                print(
+                    f"[warn] Skipping line {line_index}/{len(samples)} epoch {epoch_index}/{epochs}: {exc}"
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                break
+
+    if skipped_lines or skipped_updates:
+        print(f"[warn] Skipped {skipped_lines} oversized lines and {skipped_updates} failed line-epochs.")
+    if not losses:
+        print("[warn] No custom statement training updates completed.")
+    elif update_index % progress_interval_epochs != 0 and update_index != total_updates:
+        label = "AST-conditioned LLM" if use_ast else "regular-token-only custom LLM"
+        print(
+            f"line {last_line_index}/{len(samples)} | epoch {last_epoch_index}/{epochs} | "
+            f"completed updates {update_index}/{total_updates} | "
+            f"{label} true/false answer loss {last_loss:.4f}"
+        )
 
     if save_path is not None:
         save_checkpoint(model, model.config, save_path)
@@ -746,7 +866,9 @@ def train_custom_llm_on_texts(
 
         avg_loss = total_loss / max(1, total_items)
         losses.append(avg_loss)
-        print(f"epoch {epoch + 1}/{epochs} | custom text LM loss {avg_loss:.4f}")
+        epoch_number = epoch + 1
+        if epoch_number % 50 == 0 or epoch_number == epochs:
+            print(f"epoch {epoch_number}/{epochs} | custom text LM loss {avg_loss:.4f}")
 
     if save_path is not None:
         save_checkpoint(model, model.config, save_path)
