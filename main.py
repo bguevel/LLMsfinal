@@ -656,41 +656,18 @@ def train_imported_statement_model_menu() -> list | None:
         cleanup_after_training("imported statement model training")
 
 
-def train_both_embedding_models_on_statements(statements: list) -> None:
+def train_codec_embedding_model_on_statements(statements: list) -> None:
     if not statements:
-        print("[warn] No statements were selected for embedding training.")
+        print("[warn] No statements were selected for codec training.")
         return
 
-    print("\n--- Train Both Standalone AST Embedding Models ---")
+    print("\n--- Train AST Codec Encoder ---")
     print(f"Using the same selected training data: {len(statements)} JSONL lines")
-    truth_save_path = ask_path("Save truth-classifier AST embedding as", default=str(TRUTH_ENCODER_DEFAULT))
     codec_save_path = ask_path("Save AST embedding/unembedding codec as", default=str(TREE_CODEC_DEFAULT))
-    dim = ask_int("Embedding dimension for both models", default=128, minimum=8)
-    epochs = ask_int("Embedding epochs", default=20, minimum=1)
-    truth_batch_size = ask_int("Truth-classifier batch size", default=16, minimum=1)
+    dim = ask_int("Codec embedding dimension", default=128, minimum=8)
+    epochs = ask_int("Codec epochs", default=20, minimum=1)
     codec_batch_size = ask_int("Codec batch size", default=8, minimum=1)
-    lr = ask_float("Embedding learning rate", default=0.001, minimum=0.0)
-
-    truth_model = None
-    try:
-        truth_model, _ = train_truth_embedding_model(
-            statements=statements,
-            dim=dim,
-            epochs=epochs,
-            batch_size=truth_batch_size,
-            lr=lr,
-            save_path=truth_save_path,
-        )
-        metrics = evaluate_truth_embedding_model(truth_model, statements)
-        print(f"[ok] Saved truth-classifier AST embedding to {truth_save_path}")
-        print(f"Training-file accuracy: {metrics['correct']}/{metrics['total']} ({metrics['accuracy']:.2%})")
-    except ModuleNotFoundError as exc:
-        print(f"[warn] {exc}")
-    except Exception as exc:
-        warn_training_error("Truth-classifier AST embedding training", exc)
-    finally:
-        truth_model = None
-        cleanup_after_training("truth-classifier AST embedding training")
+    lr = ask_float("Codec learning rate", default=0.001, minimum=0.0)
 
     codec_model = None
     try:
@@ -713,17 +690,17 @@ def train_both_embedding_models_on_statements(statements: list) -> None:
 
 
 def train_statement_model_then_embeddings_menu() -> None:
-    print("\n--- Train Custom Statement Model, Then AST Embeddings ---")
-    print("Order: custom statement model -> truth-classifier AST embedding -> AST codec encoder")
+    print("\n--- Train Custom Statement Model, Then Codec Encoder ---")
+    print("Order: custom statement model -> AST codec encoder")
     selected_statements = train_custom_statement_model_menu()
 
     if selected_statements:
-        train_both_embedding_models_on_statements(selected_statements)
+        train_codec_embedding_model_on_statements(selected_statements)
 
 
 def train_statement_model_menu() -> None:
     print("\n--- Train Statement Model ---")
-    print("0) Train custom statement model, then truth classifier, then codec encoder")
+    print("0) Train custom statement model, then codec encoder")
     print("1) Imported HuggingFace model")
     print("2) Custom LLM3-style model")
     choice = input("select> ").strip().lower()
@@ -1078,7 +1055,7 @@ def main():
 
     while True:
         print("\n=== Logic Truth Evaluation Menu ===")
-        print("0) Train custom statement model, then truth classifier, then codec encoder")
+        print("0) Train custom statement model, then codec encoder")
         print("1) Generate true/false statements to a file")
         print("2) Check labels in a saved statement file")
         print("3) Train embedding models")
