@@ -7,7 +7,7 @@ This project explores whether a language model can evaluate the truth of proposi
 The central task is:
 
 ```text
-Given a logical formula F, predict whether F is true under every truth assignment.
+Given a logical formula F, predict whether F is true or false.
 ```
 
 In classical logic terms, the label is:
@@ -188,6 +188,73 @@ formula JSON
 tree encodings
 ```
 
+## How True/False Training Data Is Validated
+
+The training data is not trusted just because the generator intended a formula to be true or false. Every saved statement is checked symbolically before it is written to disk.
+
+The label definition is:
+
+```text
+label = true   means formula is a tautology
+label = false  means formula is not a tautology
+```
+
+This project does not use "false" to mean "false under every assignment." A false-labeled example may still be satisfiable. It only means the formula fails to be true under every possible assignment.
+
+The validation pipeline is:
+
+```text
+1. Choose a target label.
+2. Build a candidate formula.
+3. Enumerate the variables that appear in that formula.
+4. Enumerate every truth assignment for those variables.
+5. Evaluate the formula under each assignment.
+6. Accept the formula only if the symbolic result matches the target label.
+7. Save the label and the symbolic result as JSON metadata.
+```
+
+For a formula `F`, the truth checker computes:
+
+```text
+vars(F) = sorted distinct variable names in F
+assignments(F) = all boolean assignments over vars(F)
+is_tautology(F) = all(evaluate_formula(F, assignment) for assignment in assignments(F))
+```
+
+If `F` has `k` distinct variables, the validation step checks:
+
+```text
+2^k
+```
+
+assignments. Because this cost is exponential, the generator samples a small variable subset for each individual formula when the configured variable vocabulary is large. The overall dataset can still use hundreds of variable names across examples, but one formula stays small enough to validate exactly.
+
+True examples are built from tautology-preserving templates such as:
+
+```text
+A -> A
+(A /\ B) -> A
+A -> (A \/ B)
+(A /\ (A -> B)) -> B
+```
+
+False examples are built from formulas that are usually not tautologies, such as a lone variable, conjunctions, and random implications. Even so, the generator does not rely on "usually." It still calls the exact tautology checker before accepting the label.
+
+Before a record is saved, `statement_to_record(...)` calls:
+
+```text
+verified_statement_label(statement.formula, statement.label, statement.name)
+```
+
+That function recomputes symbolic truth and raises an error if the saved label would be wrong. The JSONL record then stores both:
+
+```text
+label
+is_tautology
+```
+
+During model training, the code loads generated JSONL with fast metadata checks instead of recomputing full truth tables for every line. This is deliberate: symbolic validation has already happened during generation, so training can avoid paying the exponential validation cost again. If you want to audit a file manually, menu option 2 recomputes symbolic labels for the saved file.
+
 ### tree_encoding.py
 
 This file contains AST encodings and structural embedding tools.
@@ -305,6 +372,70 @@ This helps the text channel and AST channel agree about structure while keeping 
 The custom model can choose either tokenizer in `main.py`.
 
 For the project's main custom-model training path, `main.py` now uses the logic-aware tokenizer by default so the tokenizer is not the experimental variable.
+
+### Logic-Aware Tokenizer Details
+
+The custom statement model sees a prompt, not the raw JSON record. For logic-aware training, the prompt has this shape:
+
+```text
+<STATEMENT>
+{formula}
+<QUESTION> tautology ?
+<ANSWER>:
+```
+
+The saved JSON label is not included in that prompt. The statement name is also not included. The model sees the formula text and must predict the answer token.
+
+The tokenizer first rewrites logical syntax into stable special tokens:
+
+```text
+(      -> <LPAREN>
+)      -> <RPAREN>
+/\     -> <AND>
+\/     -> <OR>
+->     -> <IMP>
+```
+
+Then it scans identifiers. Between `<STATEMENT>` and `<QUESTION>`, identifiers are treated as formula variables:
+
+```text
+P            -> VAR_P
+active       -> VAR_active
+atLeastOne   -> VAR_atLeastOne
+conditionA   -> VAR_conditionA
+true         -> VAR_true
+false        -> VAR_false
+statement    -> VAR_statement
+```
+
+This formula mode is important. Outside the formula, `true` and `false` are answer labels. Inside the formula, they may be ordinary propositional variables from `generations.txt`.
+
+Outside formula mode, label words are mapped to answer tokens:
+
+```text
+true  -> <TRUE>
+false -> <FALSE>
+```
+
+That means the tokenizer can distinguish:
+
+```text
+formula variable named true = VAR_true
+answer label true          = <TRUE>
+```
+
+For labeled statement training, the model input contains the prompt tokens only. The target is the single answer token. Internally, training appends the answer token only to create the shifted causal-LM target, then masks out every target position except the answer position. In effect:
+
+```text
+input visible to model:  prompt tokens
+target to predict:       <TRUE> or <FALSE>
+loss applied to:         answer token only
+loss ignored for:        prompt tokens and padding
+```
+
+This prevents the model from seeing the label in the input while still allowing normal causal-LM backpropagation through the token embeddings, position embeddings, attention blocks, MLP blocks, and unembedding layer.
+
+The tokenizer vocabulary is grown dynamically from the training prompts and answer tokens. When new tokens are added, the custom model resizes its embedding table and output unembedding layer, preserving existing weights and randomly initializing rows for new tokens.
 
 ### Imported Model Tokenizer
 
@@ -448,6 +579,207 @@ model input = concat(structural prefix, regular token stream)
 For the no-AST baseline, the structural prefix is omitted.
 
 In the custom model menu, the "regular token embeddings only" option trains on the labeled statement JSONL with the same true/false answer objective, but passes `use_ast=False`. That means the model uses token embeddings plus position embeddings, without a parallel AST soft-prefix.
+
+## Detailed Embedding Mechanics
+
+There are two different meanings of "embedding" in this project:
+
+```text
+token embeddings = learned vectors for tokenizer tokens
+AST embeddings   = structural vectors computed from the formula tree
+```
+
+The regular token path is always:
+
+```text
+tokens = tokenizer(prompt)
+E_tok = token_embedding(tokens)
+E_pos = position_embedding(positions)
+X = E_tok + E_pos
+```
+
+With no AST embedding, the Transformer receives only:
+
+```text
+X
+```
+
+With AST conditioning enabled, the formula is also encoded as a tree:
+
+```text
+z = AST_encoder(formula)
+```
+
+That vector `z` is not simply concatenated to the final hidden state. Instead, it is projected into virtual prefix token embeddings:
+
+```text
+P = reshape(W_project z, tree_prefix_tokens, d_model)
+```
+
+The Transformer receives:
+
+```text
+[P; X]
+```
+
+where `[P; X]` means the AST prefix tokens are placed before the ordinary text tokens in the sequence.
+
+This matters because self-attention is computed over the combined sequence. Text tokens can attend to the AST prefix at every layer:
+
+```text
+attention_input = [AST_prefix_tokens; prompt_tokens]
+```
+
+So the structural embedding can influence attention patterns throughout the model, not only a final classifier layer. In the custom model, after the Transformer blocks run, the prefix positions are removed before the unembedding step so the model still produces logits aligned with the original text token positions.
+
+The custom model's AST path is:
+
+```text
+formula JSON / Formula object
+        |
+        v
+AST encoder or hash embedder
+        |
+        v
+tree vector z
+        |
+        v
+linear projection W_project
+        |
+        v
+virtual prefix token embeddings
+        |
+        v
+Transformer attention together with token embeddings
+```
+
+The imported HuggingFace path uses the same idea through `inputs_embeds`:
+
+```text
+token_embeddings = imported_model.get_input_embeddings()(input_ids)
+prefix_embeddings = W_project z
+inputs_embeds = concat(prefix_embeddings, token_embeddings)
+```
+
+The imported model's tokenizer and core weights stay pretrained unless the chosen training mode says to tune more of them.
+
+### Fixed Hash AST Embedding
+
+The fixed hash embedding is deterministic and untrained. It extracts structural features from the tree and hashes them into a vector. Examples of features include:
+
+```text
+operator kind at a tree path
+variable name at a tree path
+parent-child relationships
+prefix-token unigrams
+prefix-token bigrams
+tree size and depth statistics
+```
+
+This gives the LLM a repeatable structural signal without learning an AST encoder first. It is useful as a cheap baseline because any improvement over the regular-token-only model cannot come from training a separate tree encoder.
+
+### Recursive AST Encoder
+
+The recursive encoder computes a vector bottom-up.
+
+For a variable node:
+
+```text
+z_var = tanh(W_leaf [kind(var); bucket(variable_name)] + b_leaf)
+```
+
+The variable name is placed into a stable bucket so arbitrary variable words can be embedded without requiring a separate learned row for every possible name.
+
+For a binary node:
+
+```text
+z_node = tanh(W_bin [kind(operator); z_left; z_right] + b_bin)
+```
+
+This recursively compresses the full formula tree into one vector. The same mechanism handles:
+
+```text
+and
+or
+imp
+```
+
+When this encoder is untrained, it is mostly a control condition. When it is trained as part of the truth classifier or codec, the resulting encoder can be reused as the AST embedding source for the LLM.
+
+### Truth-Classifier AST Encoder
+
+The truth-classifier encoder is trained directly on the true/false task:
+
+```text
+z = FormulaTreeEncoder(F)
+logits = linear(z)
+loss = cross_entropy(logits, label)
+```
+
+After training, only the encoder side is reused for LLM conditioning:
+
+```text
+F -> z
+```
+
+This embedding is encouraged to preserve information useful for tautology classification. It may discard details that are irrelevant to the true/false decision.
+
+### Codec AST Encoder
+
+The codec encoder is trained with a reconstruction objective:
+
+```text
+z = FormulaTreeEncoder(F)
+decoder tries to reconstruct prefix_tokens(F)
+loss = cross_entropy(reconstructed_tokens, actual_prefix_tokens)
+```
+
+This embedding is encouraged to preserve enough information to rebuild the tree. It is not directly trained to predict true/false labels, but it may produce a more generally structural representation.
+
+The codec decoder is used only during codec training and diagnostics. When conditioning the LLM, the project uses:
+
+```text
+codec.encoder(F) -> z
+```
+
+not the decoder output.
+
+### What Backpropagation Updates
+
+For the custom statement model, the answer-token loss backpropagates through all trainable custom-model layers:
+
+```text
+token embeddings
+position embeddings
+attention layers
+MLP layers
+final layer norm
+unembedding / output head
+AST projector, if AST is enabled
+selected AST encoder, only if joint AST-encoder training is enabled
+```
+
+For regular-token-only training, the AST path is disabled:
+
+```text
+use_ast = False
+```
+
+so the comparison is clean:
+
+```text
+regular-only model: prompt tokens -> true/false
+AST-conditioned model: AST prefix + prompt tokens -> true/false
+```
+
+For imported models, the training mode controls what can update:
+
+```text
+adapter_only                 = AST projector only
+adapter_and_embeddings       = AST projector + token embeddings
+adapter_and_unembedding      = AST projector + output head
+full                         = imported model + projector
+```
 
 ## Custom LLM Path
 
