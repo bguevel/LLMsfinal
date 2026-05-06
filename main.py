@@ -1009,6 +1009,7 @@ def main():
 
     while True:
         print("\n=== Logic Truth Evaluation Menu ===")
+        print("0) Train chosen statement model, then both standalone AST embedding models")
         print("1) Generate true/false statements to a file")
         print("2) Check labels in a saved statement file")
         print("3) Train embedding models")
@@ -1021,7 +1022,9 @@ def main():
 
         if choice in {"q", "quit", "exit"}:
             break
-        if choice == "1":
+        if choice == "0":
+            train_statement_model_then_embeddings_menu()
+        elif choice == "1":
             generate_statement_file_menu()
         elif choice == "2":
             check_statement_file_menu()

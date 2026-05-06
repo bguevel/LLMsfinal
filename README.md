@@ -55,6 +55,7 @@ python main.py
 Useful menu paths:
 
 ```text
+0) Train chosen statement model, then both standalone AST embedding models
 1) Generate true/false statements to a file
 2) Check labels in a saved statement file
 3) Train embedding models
@@ -65,9 +66,11 @@ Useful menu paths:
 
 The project is now focused entirely on statement truth evaluation.
 
+Option 0 runs the full sequence: train the chosen statement model first, then train both standalone AST embedding models on the same selected JSONL lines.
+
 For option 4, the flow is intentionally direct: choose the model first, then choose the embedding source, then enter the training file, line count, epochs per line, learning rate, and save path. Option 6 keeps the fuller imported/custom model menus for running checkpoints and non-statement training paths.
 
-Inside option 4, option 0 runs the full sequence: train the chosen statement model first, then train both standalone AST embedding models on the same selected JSONL lines.
+Inside option 4, option 0 provides the same combined training sequence.
 
 Model checkpoints are saved under:
 
