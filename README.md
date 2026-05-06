@@ -149,7 +149,16 @@ levels of complexity (for each level n statements are generated): 10
 set of variables: {Q, W, E, R, T, Y, U, I, O, P}
 ```
 
-This creates levels 1 through 10, using each level number as the random formula max depth, and generates `n` total statements at each level.
+The variable set may span multiple lines and may include individual letters or word-like variable names:
+
+```text
+set of variables: {A, B, C,
+active, valid, atLeastOne, conditionA, theorem, proof}
+```
+
+Variable names must start with a letter and may contain letters, digits, or underscores. This creates levels 1 through 10, using each level number as the random formula max depth, and generates `n` total statements at each level.
+
+When the configured variable vocabulary is large, each individual generated formula samples a small variable subset before symbolic truth checking. This lets the full dataset use many letters and words while keeping each truth-table evaluation tractable.
 
 During generation, each candidate formula is evaluated with the symbolic tautology checker before it is accepted for its assigned true/false label. The saved JSONL also stores `is_tautology` metadata. Training paths then trust that generated label metadata instead of recomputing symbolic truth for every example.
 
@@ -283,7 +292,15 @@ becomes:
 <LPAREN> VAR_P <IMP> <LPAREN> VAR_Q <AND> VAR_P <RPAREN> <RPAREN>
 ```
 
-This helps the text channel and AST channel agree about structure.
+Inside formula prompts, word variables are also tokenized as variables, including words that would otherwise look like labels or prompt markers:
+
+```text
+true -> VAR_true
+statement -> VAR_statement
+atLeastOne -> VAR_atLeastOne
+```
+
+This helps the text channel and AST channel agree about structure while keeping answer labels like `true` and `false` separate from formula variables.
 
 The custom model can choose either tokenizer in `main.py`.
 

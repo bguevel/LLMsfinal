@@ -107,6 +107,26 @@ def test_logic_formula_prompt_tokenizes_formula_once() -> None:
     assert "<FALSE>" not in tokens
 
 
+def test_logic_formula_prompt_tokenizes_word_variables_as_variables() -> None:
+    tokenizer = LogicAwareTokenizer()
+    tokens = tokenizer.normalize(logic_formula_prompt(Imp(Var("active"), Var("atLeastOne"))))
+
+    assert "VAR_active" in tokens
+    assert "VAR_atLeastOne" in tokens
+
+
+def test_logic_formula_prompt_keeps_reserved_words_as_formula_variables() -> None:
+    tokenizer = LogicAwareTokenizer()
+    tokens = tokenizer.normalize(logic_formula_prompt(Imp(Var("true"), Var("statement"))))
+
+    assert "VAR_true" in tokens
+    assert "VAR_statement" in tokens
+    assert "<TRUE>" not in tokens
+
+    answer_tokens = tokenizer.normalize(" true false")
+    assert answer_tokens == ["<TRUE>", "<FALSE>"]
+
+
 if __name__ == "__main__":
     test_default_wikipedia_title_file_has_500_unique_titles()
     test_wikipedia_title_lines_accept_titles_and_urls()
@@ -115,4 +135,6 @@ if __name__ == "__main__":
     test_statement_prompt_can_use_symbolic_label_override()
     test_statement_prompt_without_label_hides_saved_label_metadata()
     test_logic_formula_prompt_tokenizes_formula_once()
+    test_logic_formula_prompt_tokenizes_word_variables_as_variables()
+    test_logic_formula_prompt_keeps_reserved_words_as_formula_variables()
     print("text training source checks passed")

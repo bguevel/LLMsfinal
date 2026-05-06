@@ -230,6 +230,7 @@ def generate_statement_file_menu() -> None:
         batches=batches,
         output_path=output_path,
         seed=seed,
+        progress=True,
     )
     level_summaries = []
     for batch in batches:

@@ -116,7 +116,8 @@ class LogicAwareTokenizer(WordTokenizer):
     Tokenizer for the small custom model.
 
     It gives logical syntax stable tokens instead of leaving operators split
-    across punctuation. Variables become VAR_P, VAR_Q, etc.
+    across punctuation. Inside a ``<STATEMENT>`` formula block, identifiers
+    become variable tokens such as VAR_P, VAR_active, or VAR_atLeastOne.
     """
 
     def __init__(self, initial_text: str = "", stoi: dict[str, int] | None = None):
@@ -138,10 +139,19 @@ class LogicAwareTokenizer(WordTokenizer):
 
         raw_tokens = re.findall(r"<[A-Z]+>|[A-Za-z][A-Za-z0-9_]*|\d+|[.,:\"!?-]", text)
         tokens: list[str] = []
+        in_formula = False
 
         for token in raw_tokens:
             if token in LOGIC_SPECIAL_TOKENS:
                 tokens.append(token)
+                if token == "<STATEMENT>":
+                    in_formula = True
+                elif token in {"<QUESTION>", "<ANSWER>"}:
+                    in_formula = False
+                continue
+
+            if in_formula and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", token):
+                tokens.append(f"VAR_{token}")
                 continue
 
             lower = token.lower()

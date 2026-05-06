@@ -8,6 +8,7 @@ except ModuleNotFoundError:
     torch = None
 
 from dataset import make_truth_dataset
+from logic import formula_variables
 from statement_generation import (
     check_statement_truth,
     DEFAULT_STATEMENT_COMPLEXITY,
@@ -154,6 +155,61 @@ def test_generation_config_text_creates_depth_batches() -> None:
     assert all(batch.total_count == 500 for batch in batches)
 
 
+def test_generation_config_accepts_multiline_word_variables() -> None:
+    config = parse_generation_config_text(
+        "number of true and false (n): 12\n"
+        "levels of complexity (for each level n statements are generated): 2\n"
+        "set of variables: {A, B, active, true,\n"
+        "false, statement, atLeastOne, conditionA}\n"
+    )
+    batches = statement_generation_batches_from_config(config)
+
+    assert config.variables == (
+        "A",
+        "B",
+        "active",
+        "true",
+        "false",
+        "statement",
+        "atLeastOne",
+        "conditionA",
+    )
+    assert batches[0].variables == config.variables
+
+
+def test_current_generation_config_loads_word_variables() -> None:
+    config = parse_generation_config_text((Path("data") / "generations.txt").read_text(encoding="utf-8"))
+
+    assert "A" in config.variables
+    assert "active" in config.variables
+    assert "true" in config.variables
+    assert "atLeastOne" in config.variables
+    assert "omega" in config.variables
+
+
+def test_generation_limits_per_formula_variable_count_with_large_vocabulary() -> None:
+    variables = tuple(f"word{i}" for i in range(20))
+    statements = generate_and_save_labeled_statement_batches(
+        batches=[
+            StatementGenerationBatch(
+                label="Large Vocab",
+                total_count=8,
+                max_depth=4,
+                variables=variables,
+            )
+        ],
+        output_path=Path("_large_vocab_generation_test.jsonl"),
+        seed=23,
+    )
+
+    try:
+        assert len(statements) == 8
+        assert all(len(formula_variables(statement.formula)) <= 4 for statement in statements)
+        assert all(check_statement_truth(statement.formula) == statement.label for statement in statements)
+    finally:
+        Path("_large_vocab_generation_test.jsonl").unlink(missing_ok=True)
+
+
 def test_fast_statement_load_trusts_saved_generation_metadata() -> None:
     path = Path("_generated_statement_fast_load_test.jsonl")
     try:
@@ -215,6 +271,9 @@ if __name__ == "__main__":
     test_generated_statement_counts_are_exact()
     test_generated_statement_batches_keep_complexity_counts()
     test_generation_config_text_creates_depth_batches()
+    test_generation_config_accepts_multiline_word_variables()
+    test_current_generation_config_loads_word_variables()
+    test_generation_limits_per_formula_variable_count_with_large_vocabulary()
     test_fast_statement_load_trusts_saved_generation_metadata()
     test_statement_loader_accepts_json_arrays()
     test_statement_complexity_presets_resolve()

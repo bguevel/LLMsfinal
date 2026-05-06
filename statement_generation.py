@@ -24,6 +24,8 @@ from tree_encoding import formula_to_tree_record
 
 DEFAULT_VARIABLES = ("P", "Q", "R", "S")
 STATEMENT_QUESTION_PREFIX = "is this statement true"
+VARIABLE_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
+MAX_VARIABLES_PER_STATEMENT = 4
 
 
 @dataclass(frozen=True)
@@ -153,10 +155,60 @@ def _parse_first_float(raw: str) -> float | None:
 
 def _parse_variable_set(raw: str) -> tuple[str, ...]:
     cleaned = raw.replace("{", " ").replace("}", " ").replace(",", " ")
-    variables = tuple(item.strip() for item in cleaned.split() if item.strip())
+    variables: list[str] = []
+    seen: set[str] = set()
+    for item in (part.strip() for part in cleaned.split()):
+        if not item:
+            continue
+        if not VARIABLE_NAME_RE.fullmatch(item):
+            raise ValueError(
+                "Variable names must start with a letter and contain only "
+                f"letters, digits, or underscores: {item!r}"
+            )
+        if item not in seen:
+            variables.append(item)
+            seen.add(item)
     if not variables:
         raise ValueError("set of variables must contain at least one variable name")
-    return variables
+    return tuple(variables)
+
+
+def _generation_config_entries(text: str) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    variable_key: str | None = None
+    variable_lines: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if variable_key is not None:
+            variable_lines.append(line)
+            if "}" in line:
+                entries.append((variable_key, " ".join(variable_lines)))
+                variable_key = None
+                variable_lines = []
+            continue
+
+        if ":" not in line:
+            continue
+
+        raw_key, raw_value = line.split(":", 1)
+        key = raw_key.strip().lower()
+        value = raw_value.strip()
+
+        if "variable" in key and "{" in value and "}" not in value:
+            variable_key = key
+            variable_lines = [value]
+            continue
+
+        entries.append((key, value))
+
+    if variable_key is not None:
+        entries.append((variable_key, " ".join(variable_lines)))
+
+    return entries
 
 
 def parse_generation_config_text(text: str) -> StatementGenerationConfig:
@@ -165,33 +217,23 @@ def parse_generation_config_text(text: str) -> StatementGenerationConfig:
     variables: tuple[str, ...] | None = None
     true_fraction = 0.5
 
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-
-        raw_key, raw_value = line.split(":", 1)
-        key = raw_key.strip().lower()
-        value = raw_value.strip()
-
+    for key, value in _generation_config_entries(text):
         if "variable" in key:
             variables = _parse_variable_set(value)
         elif "fraction" in key and "true" in key:
             parsed_fraction = _parse_first_float(value)
             if parsed_fraction is None:
-                raise ValueError(f"Could not parse true fraction from line: {line}")
+                raise ValueError(f"Could not parse true fraction from value: {value}")
             true_fraction = parsed_fraction
         elif "level" in key and "complex" in key:
             parsed_levels = _parse_first_int(value)
             if parsed_levels is None:
-                raise ValueError(f"Could not parse complexity level count from line: {line}")
+                raise ValueError(f"Could not parse complexity level count from value: {value}")
             complexity_levels = parsed_levels
         elif "number" in key or "(n)" in key:
             parsed_count = _parse_first_int(value)
             if parsed_count is None:
-                raise ValueError(f"Could not parse statement count from line: {line}")
+                raise ValueError(f"Could not parse statement count from value: {value}")
             statements_per_level = parsed_count
 
     if statements_per_level is None:
@@ -249,6 +291,22 @@ def verified_statement_label(formula: Formula, expected_label: bool, name: str =
 
 def _random_variable(rng: random.Random, variables: Sequence[str]) -> Var:
     return Var(rng.choice(variables))
+
+
+def _statement_variable_pool(
+    variables: Sequence[str],
+    rng: random.Random,
+    max_variables: int = MAX_VARIABLES_PER_STATEMENT,
+) -> tuple[str, ...]:
+    if not variables:
+        raise ValueError("variables must contain at least one variable name")
+    if max_variables < 1:
+        raise ValueError("max_variables must be at least 1")
+
+    options = tuple(variables)
+    if len(options) <= max_variables:
+        return options
+    return tuple(rng.sample(options, max_variables))
 
 
 def random_formula(
@@ -380,10 +438,11 @@ def generate_labeled_statement_counts(
     while targets and attempts < max_attempts:
         attempts += 1
         label = targets[0]
+        statement_variables = _statement_variable_pool(variables, rng)
         formula = (
-            create_true_statement(max_depth=max_depth, variables=variables, rng=rng)
+            create_true_statement(max_depth=max_depth, variables=statement_variables, rng=rng)
             if label
-            else create_false_statement(max_depth=max_depth, variables=variables, rng=rng)
+            else create_false_statement(max_depth=max_depth, variables=statement_variables, rng=rng)
         )
         actual_label = check_statement_truth(formula)
 
@@ -423,6 +482,7 @@ def generate_labeled_statement_batches(
     batches: Sequence[StatementGenerationBatch],
     seed: int | None = None,
     unique: bool = True,
+    progress: bool = False,
 ) -> list[LabeledStatement]:
     if not batches:
         raise ValueError("batches must contain at least one complexity level")
@@ -439,20 +499,28 @@ def generate_labeled_statement_batches(
         if true_count + false_count == 0:
             continue
 
+        if progress:
+            print(
+                f"[generate] {batch.label}: total={batch.total_count}, "
+                f"true={true_count}, false={false_count}, max_depth={batch.max_depth}, "
+                f"variables={len(batch.variables)}, per-statement variable cap={MAX_VARIABLES_PER_STATEMENT}"
+            )
+
         batch_seed = rng.randrange(0, 2**32)
         name_prefix = f"{_statement_name_fragment(batch.label)}_{batch_index:02d}_"
-        statements.extend(
-            generate_labeled_statement_counts(
-                true_count=true_count,
-                false_count=false_count,
-                max_depth=batch.max_depth,
-                variables=batch.variables,
-                seed=batch_seed,
-                unique=unique,
-                existing_seen=seen,
-                name_prefix=name_prefix,
-            )
+        batch_statements = generate_labeled_statement_counts(
+            true_count=true_count,
+            false_count=false_count,
+            max_depth=batch.max_depth,
+            variables=batch.variables,
+            seed=batch_seed,
+            unique=unique,
+            existing_seen=seen,
+            name_prefix=name_prefix,
         )
+        statements.extend(batch_statements)
+        if progress:
+            print(f"[generate] {batch.label}: completed {len(batch_statements)} statements")
 
     rng.shuffle(statements)
     return statements
@@ -595,11 +663,13 @@ def generate_and_save_labeled_statement_batches(
     output_path: str | Path,
     seed: int | None = None,
     unique: bool = True,
+    progress: bool = False,
 ) -> list[LabeledStatement]:
     statements = generate_labeled_statement_batches(
         batches=batches,
         seed=seed,
         unique=unique,
+        progress=progress,
     )
     save_labeled_statements(statements, output_path)
     return statements
