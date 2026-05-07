@@ -16,16 +16,14 @@ from logic import (
     Var,
     formula_from_dict,
     formula_to_dict,
-    is_satisfiable,
     is_tautology,
 )
-from tree_encoding import formula_to_tree_record
 
 
 DEFAULT_VARIABLES = ("P", "Q", "R", "S")
-STATEMENT_QUESTION_PREFIX = "is this statement true"
 VARIABLE_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 MAX_VARIABLES_PER_STATEMENT = 4
+TEXT_FIELD_SEPARATOR = "\t"
 
 
 @dataclass(frozen=True)
@@ -60,21 +58,21 @@ STATEMENT_COMPLEXITY_LEVELS = (
         label="Simple",
         max_depth=1,
         variables=("P", "Q"),
-        description="short statements over two variables",
+        description="short implications over two variables",
     ),
     StatementComplexity(
         key="moderate",
         label="Moderate",
         max_depth=3,
         variables=DEFAULT_VARIABLES,
-        description="nested statements with the default variable set",
+        description="nested implications with the default variable set",
     ),
     StatementComplexity(
         key="complex",
         label="Complex",
         max_depth=5,
         variables=("P", "Q", "R", "S", "U", "V"),
-        description="deeper statements with more variable variety",
+        description="deeper implications with more variable variety",
     ),
 )
 DEFAULT_STATEMENT_COMPLEXITY = "moderate"
@@ -86,6 +84,23 @@ _COMPLEXITY_ALIASES = {
     "hard": "complex",
     "difficult": "complex",
 }
+
+
+@dataclass(frozen=True)
+class LabeledStatement:
+    name: str
+    formula: Formula
+    label: bool
+    complexity: str = ""
+    max_depth: int | None = None
+
+    @property
+    def formula_text(self) -> str:
+        return formula_to_text(self.formula)
+
+    @property
+    def text(self) -> str:
+        return self.formula_text
 
 
 def get_statement_complexity(level: str) -> StatementComplexity:
@@ -107,28 +122,28 @@ def _parse_complexity_key(raw: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def formula_to_text(formula: Formula, *, top_level: bool = True) -> str:
+    if isinstance(formula, Var):
+        return formula.name
+
+    if isinstance(formula, And):
+        return f"( {formula_to_text(formula.left, top_level=False)} AND {formula_to_text(formula.right, top_level=False)} )"
+
+    if isinstance(formula, Or):
+        return f"( {formula_to_text(formula.left, top_level=False)} OR {formula_to_text(formula.right, top_level=False)} )"
+
+    if isinstance(formula, Imp):
+        text = f"{formula_to_text(formula.left, top_level=False)} -> {formula_to_text(formula.right, top_level=False)}"
+        return text if top_level else f"( {text} )"
+
+    raise TypeError(f"Unknown formula type: {type(formula)}")
+
+
 def statement_text_for_formula(formula: Formula) -> str:
-    return f"{STATEMENT_QUESTION_PREFIX} {formula}"
-
-
-@dataclass(frozen=True)
-class LabeledStatement:
-    name: str
-    formula: Formula
-    label: bool
-
-    @property
-    def text(self) -> str:
-        return statement_text_for_formula(self.formula)
+    return formula_to_text(formula)
 
 
 def check_statement_truth(formula: Formula) -> bool:
-    """
-    Return True when a formula is true under every truth assignment.
-
-    In this propositional framework, "false" examples are formulas that are not
-    tautologies. They may still be satisfiable under some assignments.
-    """
     return is_tautology(formula)
 
 
@@ -157,9 +172,13 @@ def _parse_variable_set(raw: str) -> tuple[str, ...]:
     cleaned = raw.replace("{", " ").replace("}", " ").replace(",", " ")
     variables: list[str] = []
     seen: set[str] = set()
+    reserved = {"AND", "OR"}
+
     for item in (part.strip() for part in cleaned.split()):
         if not item:
             continue
+        if item.upper() in reserved or item == "->":
+            raise ValueError(f"Variable name conflicts with logical syntax: {item!r}")
         if not VARIABLE_NAME_RE.fullmatch(item):
             raise ValueError(
                 "Variable names must start with a letter and contain only "
@@ -168,6 +187,7 @@ def _parse_variable_set(raw: str) -> tuple[str, ...]:
         if item not in seen:
             variables.append(item)
             seen.add(item)
+
     if not variables:
         raise ValueError("set of variables must contain at least one variable name")
     return tuple(variables)
@@ -261,8 +281,7 @@ def parse_generation_config_text(text: str) -> StatementGenerationConfig:
 
 
 def load_generation_config(path: str | Path) -> StatementGenerationConfig:
-    config_path = Path(path)
-    return parse_generation_config_text(config_path.read_text(encoding="utf-8"))
+    return parse_generation_config_text(Path(path).read_text(encoding="utf-8"))
 
 
 def statement_generation_batches_from_config(
@@ -283,9 +302,7 @@ def statement_generation_batches_from_config(
 def verified_statement_label(formula: Formula, expected_label: bool, name: str = "<unnamed>") -> bool:
     actual_label = check_statement_truth(formula)
     if actual_label != expected_label:
-        raise ValueError(
-            f"Truth label mismatch for {name}: expected {expected_label}, got {actual_label}"
-        )
+        raise ValueError(f"Truth label mismatch for {name}: expected {expected_label}, got {actual_label}")
     return actual_label
 
 
@@ -330,32 +347,50 @@ def random_formula(
     return op(left, right)
 
 
+def random_complex_formula(
+    max_depth: int = 2,
+    variables: Sequence[str] = DEFAULT_VARIABLES,
+    rng: random.Random | None = None,
+) -> Formula:
+    rng = rng or random.Random()
+    depth = max(1, max_depth)
+
+    for _ in range(100):
+        formula = random_formula(depth, variables, rng)
+        if not isinstance(formula, Var):
+            return formula
+
+    left = _random_variable(rng, variables)
+    right = _random_variable(rng, variables)
+    return rng.choice((And, Or, Imp))(left, right)
+
+
 def create_true_statement(
     max_depth: int = 3,
     variables: Sequence[str] = DEFAULT_VARIABLES,
     rng: random.Random | None = None,
 ) -> Formula:
     rng = rng or random.Random()
-    a = random_formula(max_depth, variables, rng)
-    b = random_formula(max_depth, variables, rng)
-    c = random_formula(max_depth, variables, rng)
+    depth = max(1, max_depth)
 
-    templates = [
-        lambda: Imp(a, a),
-        lambda: Imp(a, Imp(b, a)),
-        lambda: Imp(And(a, b), a),
-        lambda: Imp(And(a, b), b),
-        lambda: Imp(a, Or(a, b)),
-        lambda: Imp(b, Or(a, b)),
-        lambda: Imp(And(a, Imp(a, b)), b),
-        lambda: Imp(Imp(a, b), Imp(Imp(b, c), Imp(a, c))),
-        lambda: Imp(Or(a, b), Or(b, a)),
-        lambda: Imp(And(a, b), And(b, a)),
-    ]
+    for _ in range(300):
+        a = random_formula(depth, variables, rng)
+        b = random_formula(depth, variables, rng)
+        c = random_formula(max(1, depth - 1), variables, rng)
 
-    for _ in range(100):
+        templates = [
+            lambda: Imp(a, Or(a, b)),
+            lambda: Imp(b, Or(a, b)),
+            lambda: Imp(And(a, b), And(b, a)),
+            lambda: Imp(And(a, b), Or(a, c)),
+            lambda: Imp(And(a, Imp(a, b)), Or(b, c)),
+            lambda: Imp(Imp(a, b), Imp(Imp(b, c), Imp(a, c))),
+            lambda: Imp(Or(a, b), Or(b, a)),
+            lambda: Imp(a, Imp(b, a)),
+        ]
+
         formula = rng.choice(templates)()
-        if check_statement_truth(formula):
+        if isinstance(formula, Imp) and not isinstance(formula.right, Var) and check_statement_truth(formula):
             return formula
 
     raise RuntimeError("Could not generate a true statement")
@@ -367,25 +402,21 @@ def create_false_statement(
     rng: random.Random | None = None,
 ) -> Formula:
     rng = rng or random.Random()
+    depth = max(1, max_depth)
 
-    false_templates = [
-        lambda: _random_variable(rng, variables),
-        lambda: And(random_formula(max_depth, variables, rng), random_formula(max_depth, variables, rng)),
-        lambda: Or(_random_variable(rng, variables), _random_variable(rng, variables)),
-        lambda: Imp(_random_variable(rng, variables), _random_variable(rng, variables)),
-        lambda: Imp(
-            random_formula(max_depth, variables, rng),
-            And(random_formula(max_depth, variables, rng), random_formula(max_depth, variables, rng)),
-        ),
-    ]
+    for _ in range(700):
+        lhs = random_formula(depth, variables, rng)
+        rhs_depth = max(1, depth - 1)
+        rhs = random_complex_formula(rhs_depth, variables, rng)
 
-    for _ in range(500):
-        if rng.random() < 0.7:
-            formula = rng.choice(false_templates)()
-        else:
-            formula = random_formula(max_depth, variables, rng)
+        templates = [
+            lambda: Imp(lhs, rhs),
+            lambda: Imp(Or(lhs, random_formula(rhs_depth, variables, rng)), And(rhs, random_formula(rhs_depth, variables, rng))),
+            lambda: Imp(And(lhs, random_formula(rhs_depth, variables, rng)), rhs),
+        ]
+        formula = rng.choice(templates)()
 
-        if not check_statement_truth(formula):
+        if isinstance(formula, Imp) and not isinstance(formula.right, Var) and not check_statement_truth(formula):
             return formula
 
     raise RuntimeError("Could not generate a false statement")
@@ -398,6 +429,7 @@ def generate_labeled_statements(
     seed: int | None = None,
     true_fraction: float = 0.5,
     unique: bool = True,
+    complexity: str = "",
 ) -> list[LabeledStatement]:
     true_count, false_count = split_label_counts(n, true_fraction)
     return generate_labeled_statement_counts(
@@ -407,6 +439,7 @@ def generate_labeled_statements(
         variables=variables,
         seed=seed,
         unique=unique,
+        complexity=complexity,
     )
 
 
@@ -419,6 +452,7 @@ def generate_labeled_statement_counts(
     unique: bool = True,
     existing_seen: set[str] | None = None,
     name_prefix: str = "",
+    complexity: str = "",
 ) -> list[LabeledStatement]:
     if true_count < 0:
         raise ValueError("true_count must be non-negative")
@@ -433,7 +467,7 @@ def generate_labeled_statement_counts(
     statements: list[LabeledStatement] = []
     seen = existing_seen if existing_seen is not None else set()
     attempts = 0
-    max_attempts = max(1000, n * 200)
+    max_attempts = max(1000, n * 250)
 
     while targets and attempts < max_attempts:
         attempts += 1
@@ -461,6 +495,8 @@ def generate_labeled_statement_counts(
                 name=f"{name_prefix}{'true' if label else 'false'}_{index:04d}",
                 formula=formula,
                 label=label,
+                complexity=complexity,
+                max_depth=max_depth,
             )
         )
         targets.pop(0)
@@ -517,13 +553,116 @@ def generate_labeled_statement_batches(
             unique=unique,
             existing_seen=seen,
             name_prefix=name_prefix,
+            complexity=batch.label,
         )
         statements.extend(batch_statements)
         if progress:
             print(f"[generate] {batch.label}: completed {len(batch_statements)} statements")
 
-    rng.shuffle(statements)
     return statements
+
+
+def statement_to_text_line(statement: LabeledStatement) -> str:
+    label = "true" if statement.label else "false"
+    complexity = statement.complexity or "Unknown"
+    return TEXT_FIELD_SEPARATOR.join((statement.formula_text, label, complexity))
+
+
+def _parse_label(raw: str, *, line_number: int | None = None) -> bool:
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    location = f" on line {line_number}" if line_number is not None else ""
+    raise ValueError(f"Expected true/false label{location}, got {raw!r}")
+
+
+FORMULA_TOKEN_RE = re.compile(r"->|/\\|\\/|\(|\)|[A-Za-z][A-Za-z0-9_]*")
+
+
+def _tokenize_formula_text(text: str) -> list[str]:
+    tokens = FORMULA_TOKEN_RE.findall(text)
+    if not tokens:
+        raise ValueError("formula is empty")
+    return tokens
+
+
+class _FormulaParser:
+    def __init__(self, tokens: Sequence[str]):
+        self.tokens = list(tokens)
+        self.index = 0
+
+    def parse(self) -> Formula:
+        formula = self.parse_implication()
+        if self.index != len(self.tokens):
+            raise ValueError(f"Unexpected token {self.tokens[self.index]!r}")
+        return formula
+
+    def peek(self) -> str | None:
+        return self.tokens[self.index] if self.index < len(self.tokens) else None
+
+    def take(self) -> str:
+        token = self.peek()
+        if token is None:
+            raise ValueError("Unexpected end of formula")
+        self.index += 1
+        return token
+
+    def parse_implication(self) -> Formula:
+        left = self.parse_or()
+        if self.peek() == "->":
+            self.take()
+            right = self.parse_implication()
+            return Imp(left, right)
+        return left
+
+    def parse_or(self) -> Formula:
+        formula = self.parse_and()
+        while self.peek() is not None and self.peek().upper() in {"OR", "\\/"}:
+            self.take()
+            formula = Or(formula, self.parse_and())
+        return formula
+
+    def parse_and(self) -> Formula:
+        formula = self.parse_atom()
+        while self.peek() is not None and self.peek().upper() in {"AND", "/\\"}:
+            self.take()
+            formula = And(formula, self.parse_atom())
+        return formula
+
+    def parse_atom(self) -> Formula:
+        token = self.take()
+        if token == "(":
+            formula = self.parse_implication()
+            if self.take() != ")":
+                raise ValueError("Expected closing parenthesis")
+            return formula
+        if token == ")":
+            raise ValueError("Unexpected closing parenthesis")
+        if token.upper() in {"AND", "OR"} or token in {"->", "/\\", "\\/"}:
+            raise ValueError(f"Expected variable, got operator {token!r}")
+        return Var(token)
+
+
+def parse_formula_text(text: str) -> Formula:
+    return _FormulaParser(_tokenize_formula_text(text)).parse()
+
+
+def text_line_to_statement(line: str, *, line_number: int | None = None) -> LabeledStatement:
+    parts = line.rstrip("\n").split(TEXT_FIELD_SEPARATOR)
+    if len(parts) < 2:
+        location = f" on line {line_number}" if line_number is not None else ""
+        raise ValueError(
+            f"Expected text data as formula<TAB>true|false<TAB>complexity{location}"
+        )
+
+    formula_text = parts[0].strip()
+    label = _parse_label(parts[1], line_number=line_number)
+    complexity = parts[2].strip() if len(parts) >= 3 else ""
+    formula = parse_formula_text(formula_text)
+    name = f"line_{line_number:04d}" if line_number is not None else "line"
+    return LabeledStatement(name=name, formula=formula, label=label, complexity=complexity)
 
 
 def statement_to_record(statement: LabeledStatement) -> dict:
@@ -532,10 +671,10 @@ def statement_to_record(statement: LabeledStatement) -> dict:
         "name": statement.name,
         "label": statement.label,
         "is_tautology": actual_label,
-        "is_satisfiable": is_satisfiable(statement.formula),
-        "text": statement.text,
+        "text": statement.formula_text,
+        "complexity": statement.complexity,
+        "max_depth": statement.max_depth,
         "formula": formula_to_dict(statement.formula),
-        "tree": formula_to_tree_record(statement.formula),
     }
 
 
@@ -556,9 +695,11 @@ def record_to_statement(record: dict, verify_label: bool = True) -> LabeledState
         )
 
     return LabeledStatement(
-        name=str(record["name"]),
+        name=str(record.get("name", "record")),
         formula=formula,
         label=label,
+        complexity=str(record.get("complexity", "")),
+        max_depth=record.get("max_depth"),
     )
 
 
@@ -569,7 +710,7 @@ def save_labeled_statements(statements: Iterable[LabeledStatement], output_path:
 
     with path.open("w", encoding="utf-8") as f:
         for statement in statements:
-            f.write(json.dumps(statement_to_record(statement), sort_keys=True))
+            f.write(statement_to_text_line(statement))
             f.write("\n")
 
     return path
@@ -591,25 +732,26 @@ def load_labeled_statements(input_path: str | Path, verify_labels: bool = True) 
         f.seek(0)
 
         if first == "[":
-            try:
-                records = json.load(f)
-            except Exception as exc:
-                raise ValueError(f"Could not read JSON statement array from {path}") from exc
+            records = json.load(f)
             if not isinstance(records, list):
                 raise ValueError(f"Expected a JSON array of statement records in {path}")
-            for index, record in enumerate(records, start=1):
-                try:
-                    statements.append(record_to_statement(record, verify_label=verify_labels))
-                except Exception as exc:
-                    raise ValueError(f"Could not read statement array item {index}") from exc
-            return statements
+            return [
+                record_to_statement(record, verify_label=verify_labels)
+                for record in records
+            ]
 
         for line_number, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
+            stripped = line.strip()
+            if not stripped:
                 continue
             try:
-                statements.append(record_to_statement(json.loads(line), verify_label=verify_labels))
+                if stripped.startswith("{"):
+                    statements.append(record_to_statement(json.loads(stripped), verify_label=verify_labels))
+                else:
+                    statement = text_line_to_statement(line, line_number=line_number)
+                    if verify_labels:
+                        verified_statement_label(statement.formula, statement.label, statement.name)
+                    statements.append(statement)
             except Exception as exc:
                 raise ValueError(f"Could not read statement on line {line_number}") from exc
 
@@ -624,6 +766,7 @@ def generate_and_save_labeled_statements(
     seed: int | None = None,
     true_fraction: float = 0.5,
     unique: bool = True,
+    complexity: str = "",
 ) -> list[LabeledStatement]:
     statements = generate_labeled_statements(
         n=n,
@@ -632,6 +775,7 @@ def generate_and_save_labeled_statements(
         seed=seed,
         true_fraction=true_fraction,
         unique=unique,
+        complexity=complexity,
     )
     save_labeled_statements(statements, output_path)
     return statements
@@ -645,6 +789,7 @@ def generate_and_save_labeled_statement_counts(
     variables: Sequence[str] = DEFAULT_VARIABLES,
     seed: int | None = None,
     unique: bool = True,
+    complexity: str = "",
 ) -> list[LabeledStatement]:
     statements = generate_labeled_statement_counts(
         true_count=true_count,
@@ -653,6 +798,7 @@ def generate_and_save_labeled_statement_counts(
         variables=variables,
         seed=seed,
         unique=unique,
+        complexity=complexity,
     )
     save_labeled_statements(statements, output_path)
     return statements
@@ -676,9 +822,9 @@ def generate_and_save_labeled_statement_batches(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate labeled propositional-logic statements.")
+    parser = argparse.ArgumentParser(description="Generate labeled propositional-logic statements as text.")
     parser.add_argument("n", type=int, help="Number of statements to generate.")
-    parser.add_argument("output", type=Path, help="JSONL file to write.")
+    parser.add_argument("output", type=Path, help="Text file to write.")
     parser.add_argument(
         "--complexity",
         type=_parse_complexity_key,
@@ -707,6 +853,7 @@ def main() -> None:
         seed=args.seed,
         true_fraction=args.true_fraction,
         unique=not args.allow_duplicates,
+        complexity=complexity.label,
     )
 
     true_count = sum(1 for statement in statements if statement.label)

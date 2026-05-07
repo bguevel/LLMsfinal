@@ -1,19 +1,9 @@
 from __future__ import annotations
 
-"""
-AST-conditioned adaptation of the user's LLM3.py Transformer.
-
-The original model is a causal next-token Transformer. This version keeps that
-shape and adds a tree_embedding input projected into the token stream.
-"""
-
 import math
 import os
 import re
-import json
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -27,32 +17,88 @@ except ModuleNotFoundError:
     F = None
 
 from logic import Formula
-from statement_generation import LabeledStatement
-from tree_encoding import FormulaTreeEncoder, HashingTreeEmbedder
+from statement_generation import LabeledStatement, formula_to_text
 
-
-LOGIC_SPECIAL_TOKENS = [
-    "<PAD>",
-    "<LPAREN>",
-    "<RPAREN>",
-    "<AND>",
-    "<OR>",
-    "<IMP>",
-    "<TRUE>",
-    "<FALSE>",
-    "<STATEMENT>",
-    "<QUESTION>",
-    "<ANSWER>",
-]
 
 PAD_TOKEN = "<PAD>"
-WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
-WIKIPEDIA_HEADERS = {"User-Agent": "LogicTruthASTProject/1.0"}
+TRUE_TOKEN = "true"
+FALSE_TOKEN = "false"
+
+MODE_REGULAR = "regular"
+MODE_DEPTH = "depth"
+MODE_SIDE = "side"
+MODE_LOGICAL = "logical"
+MODE_DISTANCE = "distance"
+MODE_ALL = "all"
+
+EMBEDDING_MODES = (
+    MODE_REGULAR,
+    MODE_DEPTH,
+    MODE_SIDE,
+    MODE_LOGICAL,
+    MODE_DISTANCE,
+    MODE_ALL,
+)
+
+EMBEDDING_MODE_LABELS = {
+    MODE_REGULAR: "regular token + position embeddings",
+    MODE_DEPTH: "token + position + parenthesis-depth embeddings",
+    MODE_SIDE: "token + position + LHS/RHS embeddings",
+    MODE_LOGICAL: "token + position + logical-role embeddings",
+    MODE_DISTANCE: "token + position + implication-distance embeddings",
+    MODE_ALL: "token + position + all structural embeddings",
+}
+
+EMBEDDING_MODE_ALIASES = {
+    "1": MODE_REGULAR,
+    "regular": MODE_REGULAR,
+    "base": MODE_REGULAR,
+    "2": MODE_DEPTH,
+    "depth": MODE_DEPTH,
+    "parentheses": MODE_DEPTH,
+    "parenthesis": MODE_DEPTH,
+    "3": MODE_SIDE,
+    "side": MODE_SIDE,
+    "lhs_rhs": MODE_SIDE,
+    "lhs-vs-rhs": MODE_SIDE,
+    "4": MODE_LOGICAL,
+    "logical": MODE_LOGICAL,
+    "logic": MODE_LOGICAL,
+    "5": MODE_DISTANCE,
+    "distance": MODE_DISTANCE,
+    "implication-distance": MODE_DISTANCE,
+    "6": MODE_ALL,
+    "all": MODE_ALL,
+    "combined": MODE_ALL,
+}
+
+LOGICAL_PAD = 0
+LOGICAL_VARIABLE = 1
+LOGICAL_PARAMETER = 2
+LOGICAL_PARENTHESIS = 3
+LOGICAL_OR = 4
+LOGICAL_IMPLICATION = 5
+LOGICAL_AND = 6
+
+SIDE_NONE = 0
+SIDE_LHS = 1
+SIDE_IMPLICATION = 2
+SIDE_RHS = 3
 
 
 def _require_torch() -> None:
     if torch is None or nn is None or F is None:
         raise ModuleNotFoundError("custom_llm requires torch")
+
+
+def normalize_embedding_mode(mode: str | int | None) -> str:
+    if mode is None:
+        return MODE_REGULAR
+    normalized = str(mode).strip().lower().replace(" ", "_")
+    if normalized in EMBEDDING_MODE_ALIASES:
+        return EMBEDDING_MODE_ALIASES[normalized]
+    valid = ", ".join(EMBEDDING_MODES)
+    raise ValueError(f"Unknown embedding mode {mode!r}. Choose one of: {valid}")
 
 
 @dataclass
@@ -63,9 +109,13 @@ class Config:
     d_vocab: int
     n_heads: int
     num_blocks: int
-    tree_embedding_dim: int = 256
-    tree_prefix_tokens: int = 4
     max_seq_len: int = 4096
+    embedding_mode: str = MODE_REGULAR
+    max_parentheses_depth: int = 64
+    max_implication_distance: int = 256
+
+    def __post_init__(self) -> None:
+        self.embedding_mode = normalize_embedding_mode(self.embedding_mode)
 
 
 class WordTokenizer:
@@ -74,6 +124,8 @@ class WordTokenizer:
         self.itos: dict[int, str] = {i: w for w, i in self.stoi.items()}
         if stoi is None:
             self.add_word(PAD_TOKEN)
+            self.add_word(TRUE_TOKEN)
+            self.add_word(FALSE_TOKEN)
         if initial_text:
             self.add_text(initial_text)
 
@@ -86,8 +138,8 @@ class WordTokenizer:
         return len(self.stoi)
 
     def normalize(self, text: str) -> list[str]:
-        text = text.lower()
-        return re.findall(r"\w+(?:[-']\w+)*|[.,:\"()!?/\\>-]", text)
+        tokens = re.findall(r"->|[A-Za-z][A-Za-z0-9_]*|\d+|[()]|[^\s]", text)
+        return [token.lower() if token not in {"->", "(", ")"} else token for token in tokens]
 
     def add_text(self, text: str) -> None:
         for word in self.normalize(text):
@@ -102,204 +154,108 @@ class WordTokenizer:
         return new_id
 
     def encode(self, text: str) -> list[int]:
-        ids: list[int] = []
-        for word in self.normalize(text):
-            ids.append(self.add_word(word))
-        return ids
+        return [self.add_word(word) for word in self.normalize(text)]
 
-    def decode(self, ids: list[int]) -> str:
-        return " ".join(self.itos[i] for i in ids)
+    def decode(self, ids: Sequence[int]) -> str:
+        return " ".join(self.itos.get(int(i), PAD_TOKEN) for i in ids)
 
 
-class LogicAwareTokenizer(WordTokenizer):
-    """
-    Tokenizer for the small custom model.
-
-    It gives logical syntax stable tokens instead of leaving operators split
-    across punctuation. Inside a ``<STATEMENT>`` formula block, identifiers
-    become variable tokens such as VAR_P, VAR_active, or VAR_atLeastOne.
-    """
-
-    def __init__(self, initial_text: str = "", stoi: dict[str, int] | None = None):
-        super().__init__(initial_text="", stoi=stoi)
-        if stoi is None:
-            for token in LOGIC_SPECIAL_TOKENS:
-                self.add_word(token)
-        if initial_text:
-            self.add_text(initial_text)
-
-    def normalize(self, text: str) -> list[str]:
-        text = (
-            text.replace("/\\", " <AND> ")
-            .replace("\\/", " <OR> ")
-            .replace("->", " <IMP> ")
-            .replace("(", " <LPAREN> ")
-            .replace(")", " <RPAREN> ")
-        )
-
-        raw_tokens = re.findall(r"<[A-Z]+>|[A-Za-z][A-Za-z0-9_]*|\d+|[.,:\"!?-]", text)
-        tokens: list[str] = []
-        in_formula = False
-
-        for token in raw_tokens:
-            if token in LOGIC_SPECIAL_TOKENS:
-                tokens.append(token)
-                if token == "<STATEMENT>":
-                    in_formula = True
-                elif token in {"<QUESTION>", "<ANSWER>"}:
-                    in_formula = False
-                continue
-
-            if in_formula and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", token):
-                tokens.append(f"VAR_{token}")
-                continue
-
-            lower = token.lower()
-            if lower == "true":
-                tokens.append("<TRUE>")
-            elif lower == "false":
-                tokens.append("<FALSE>")
-            elif lower == "statement":
-                tokens.append("<STATEMENT>")
-            elif lower == "question":
-                tokens.append("<QUESTION>")
-            elif lower == "answer":
-                tokens.append("<ANSWER>")
-            elif re.fullmatch(r"[A-Z][A-Z0-9_]*", token):
-                tokens.append(f"VAR_{token}")
-            else:
-                tokens.append(lower)
-
-        return tokens
+def make_tokenizer(stoi: dict[str, int] | None = None) -> WordTokenizer:
+    return WordTokenizer(stoi=stoi)
 
 
-def make_tokenizer(tokenizer_kind: str = "word", stoi: dict[str, int] | None = None) -> WordTokenizer:
-    tokenizer_kind = tokenizer_kind.lower().strip()
-    initial_text = "" if stoi is not None else "statement answer true false"
-    if tokenizer_kind == "logic":
-        return LogicAwareTokenizer(initial_text, stoi=stoi)
-    if tokenizer_kind == "word":
-        return WordTokenizer(initial_text, stoi=stoi)
-    raise ValueError("tokenizer_kind must be 'word' or 'logic'")
+def formula_prompt(formula: Formula | str) -> str:
+    if isinstance(formula, str):
+        return formula.strip()
+    return formula_to_text(formula)
 
 
-def logic_token_text(text: str) -> str:
-    tokenizer = LogicAwareTokenizer()
-    return " ".join(tokenizer.normalize(text))
+def statement_prompt(statement: LabeledStatement) -> str:
+    return statement.formula_text
 
 
-def logic_formula_prompt(formula: Formula) -> str:
-    return (
-        "<STATEMENT>\n"
-        f"{formula}\n"
-        "<QUESTION> tautology ?\n"
-        "<ANSWER>:"
-    )
+def _logical_type_id(token: str) -> int:
+    lower = token.lower()
+    if token == PAD_TOKEN:
+        return LOGICAL_PAD
+    if lower == "or":
+        return LOGICAL_OR
+    if lower == "and":
+        return LOGICAL_AND
+    if token == "->":
+        return LOGICAL_IMPLICATION
+    if token in {"(", ")"}:
+        return LOGICAL_PARENTHESIS
+    if lower in {TRUE_TOKEN, FALSE_TOKEN} or re.fullmatch(r"\d+", lower):
+        return LOGICAL_PARAMETER
+    if re.fullmatch(r"[a-z][a-z0-9_]*", lower):
+        return LOGICAL_VARIABLE
+    return LOGICAL_PARAMETER
 
 
-def wikipedia_title_from_line(line: str) -> str:
-    line = line.strip()
-    if not line:
-        return ""
+def token_feature_ids(
+    tokens: Sequence[str],
+    *,
+    max_parentheses_depth: int = 64,
+    max_implication_distance: int = 256,
+) -> dict[str, list[int]]:
+    depth_ids: list[int] = []
+    side_ids: list[int] = []
+    logical_ids: list[int] = []
+    distance_ids: list[int] = []
 
-    if line.startswith("http://") or line.startswith("https://"):
-        parsed = urllib.parse.urlparse(line)
-        if "/wiki/" in parsed.path:
-            title = parsed.path.split("/wiki/", 1)[1]
-            return urllib.parse.unquote(title).replace("_", " ")
+    implication_positions = [index for index, token in enumerate(tokens) if token == "->"]
+    saw_implication = False
+    depth = 0
 
-    return line
+    for index, token in enumerate(tokens):
+        if token == PAD_TOKEN:
+            depth_ids.append(0)
+            side_ids.append(SIDE_NONE)
+            logical_ids.append(LOGICAL_PAD)
+            distance_ids.append(0)
+            continue
 
-
-def fetch_wikipedia_article_text(title_or_url: str, timeout: int = 20) -> str:
-    title = wikipedia_title_from_line(title_or_url)
-    if not title:
-        return ""
-
-    query = urllib.parse.urlencode(
-        {
-            "action": "query",
-            "prop": "extracts",
-            "explaintext": "1",
-            "format": "json",
-            "redirects": "1",
-            "titles": title,
-        }
-    )
-    request = urllib.request.Request(
-        f"{WIKIPEDIA_API}?{query}",
-        headers=WIKIPEDIA_HEADERS,
-    )
-
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
-
-    pages = data.get("query", {}).get("pages", {})
-    for page in pages.values():
-        extract = (page.get("extract") or "").strip()
-        if extract:
-            return extract
-
-    return ""
-
-
-def read_wikipedia_titles_file(path: str | Path) -> list[str]:
-    titles: list[str] = []
-    with Path(path).open("r", encoding="utf-8") as f:
-        for line in f:
-            title = wikipedia_title_from_line(line)
-            if title and not title.startswith("#"):
-                titles.append(title)
-    return titles
-
-
-def read_plain_text_files(paths: Sequence[str | Path]) -> list[str]:
-    texts: list[str] = []
-    for path in paths:
-        text = Path(path).read_text(encoding="utf-8")
-        if text.strip():
-            texts.append(text)
+        if token == "(":
+            depth += 1
+            depth_ids.append(min(depth, max_parentheses_depth))
+        elif token == ")":
+            depth_ids.append(min(max(depth, 0), max_parentheses_depth))
+            depth = max(depth - 1, 0)
         else:
-            print(f"[warn] skipping {path}: file is empty")
-    return texts
+            depth_ids.append(min(depth, max_parentheses_depth))
 
+        if token == "->":
+            side_ids.append(SIDE_IMPLICATION)
+            saw_implication = True
+        elif saw_implication:
+            side_ids.append(SIDE_RHS)
+        elif implication_positions:
+            side_ids.append(SIDE_LHS)
+        else:
+            side_ids.append(SIDE_NONE)
 
-def collect_wikipedia_article_texts(
-    titles_path: str | Path,
-    min_chars: int = 200,
-    fetcher=None,
-) -> list[str]:
-    titles = read_wikipedia_titles_file(titles_path)
-    if not titles:
-        raise ValueError(f"No Wikipedia titles found in {titles_path}")
+        logical_ids.append(_logical_type_id(token))
 
-    fetch = fetcher or fetch_wikipedia_article_text
-    texts: list[str] = []
-    for index, title in enumerate(titles, start=1):
-        print(f"[wiki {index}/{len(titles)}] fetching {title}")
-        try:
-            text = fetch(title)
-        except Exception as exc:
-            print(f"[warn] skipping {title}: {exc}")
-            continue
+        if implication_positions:
+            distance = min(abs(index - position) for position in implication_positions)
+            distance_ids.append(min(distance, max_implication_distance))
+        else:
+            distance_ids.append(max_implication_distance)
 
-        if len(text) < min_chars:
-            print(f"[warn] skipping {title}: article text too short")
-            continue
-
-        texts.append(f"Title: {title}\n{text}")
-
-    if not texts:
-        raise ValueError("No Wikipedia articles were fetched successfully")
-
-    return texts
+    return {
+        "depth": depth_ids,
+        "side": side_ids,
+        "logical": logical_ids,
+        "distance": distance_ids,
+    }
 
 
 if nn is None:
 
-    class AstConditionedTransformer:
+    class CustomLogicTransformer:
         def __init__(self, *args, **kwargs):
-            raise ModuleNotFoundError("AstConditionedTransformer requires torch")
+            raise ModuleNotFoundError("CustomLogicTransformer requires torch")
 
 else:
 
@@ -372,26 +328,17 @@ else:
             return x
 
 
-    class AstConditionedTransformer(nn.Module):
-        """
-        Your LLM3-style causal Transformer with an additional AST vector input.
-
-        The tree vector is projected into d_model and added to each token
-        representation. This keeps the original next-token objective but gives
-        the network a parallel structural signal while it reads the statement.
-        """
-
+    class CustomLogicTransformer(nn.Module):
         def __init__(self, config: Config, tokenizer: WordTokenizer):
             super().__init__()
             self.config = config
             self.tokenizer = tokenizer
             self.embed = Embedding(config, tokenizer.vocab_size)
             self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
-            self.tree_proj = nn.Linear(
-                config.tree_embedding_dim,
-                config.tree_prefix_tokens * config.d_model,
-                bias=False,
-            )
+            self.depth_emb = nn.Embedding(config.max_parentheses_depth + 1, config.d_model)
+            self.side_emb = nn.Embedding(4, config.d_model)
+            self.logical_emb = nn.Embedding(7, config.d_model)
+            self.distance_emb = nn.Embedding(config.max_implication_distance + 1, config.d_model)
             self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_blocks)])
             self.ln_f = nn.LayerNorm(config.d_model)
             self.unembed = nn.Linear(config.d_model, tokenizer.vocab_size)
@@ -425,40 +372,59 @@ else:
             new_unembed.bias.data[:old_vocab_size] = old_unembed.bias.data
             self.unembed = new_unembed
 
-        def forward(self, token_ids: torch.Tensor, tree_embedding: torch.Tensor | None = None) -> torch.Tensor:
+        def _feature_tensors(self, token_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+            rows = token_ids.tolist()
+            feature_rows = {"depth": [], "side": [], "logical": [], "distance": []}
+
+            for row in rows:
+                tokens = [self.tokenizer.itos.get(int(token_id), PAD_TOKEN) for token_id in row]
+                features = token_feature_ids(
+                    tokens,
+                    max_parentheses_depth=self.config.max_parentheses_depth,
+                    max_implication_distance=self.config.max_implication_distance,
+                )
+                for key in feature_rows:
+                    feature_rows[key].append(features[key])
+
+            return {
+                key: torch.tensor(value, dtype=torch.long, device=token_ids.device)
+                for key, value in feature_rows.items()
+            }
+
+        def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
             if token_ids.dim() == 1:
                 token_ids = token_ids.unsqueeze(0)
 
             batch, tokens = token_ids.shape
-            extra_tokens = self.config.tree_prefix_tokens if tree_embedding is not None else 0
-            if tokens + extra_tokens > self.config.max_seq_len:
-                raise ValueError(f"Sequence length {tokens + extra_tokens} exceeds max_seq_len={self.config.max_seq_len}")
+            if tokens > self.config.max_seq_len:
+                raise ValueError(f"Sequence length {tokens} exceeds max_seq_len={self.config.max_seq_len}")
 
-            tok = self.embed(token_ids)
+            token_embedding = self.embed(token_ids)
             pos_ids = torch.arange(tokens, device=token_ids.device)
-            pos = self.pos_emb(pos_ids).unsqueeze(0)
-            x = tok + pos
+            positional_embedding = self.pos_emb(pos_ids).unsqueeze(0).expand(batch, -1, -1)
+            x = token_embedding + positional_embedding
 
-            if tree_embedding is not None:
-                if tree_embedding.dim() == 1:
-                    tree_embedding = tree_embedding.unsqueeze(0)
-                if tree_embedding.size(0) == 1 and batch > 1:
-                    tree_embedding = tree_embedding.expand(batch, -1)
-                prefix = self.tree_proj(tree_embedding.to(device=x.device, dtype=x.dtype))
-                prefix = prefix.view(batch, self.config.tree_prefix_tokens, self.config.d_model)
-                x = torch.cat([prefix, x], dim=1)
+            mode = normalize_embedding_mode(self.config.embedding_mode)
+            if mode != MODE_REGULAR:
+                features = self._feature_tensors(token_ids)
+                if mode in {MODE_DEPTH, MODE_ALL}:
+                    x = x + self.depth_emb(features["depth"])
+                if mode in {MODE_SIDE, MODE_ALL}:
+                    x = x + self.side_emb(features["side"])
+                if mode in {MODE_LOGICAL, MODE_ALL}:
+                    x = x + self.logical_emb(features["logical"])
+                if mode in {MODE_DISTANCE, MODE_ALL}:
+                    x = x + self.distance_emb(features["distance"])
 
-            mask = self._get_causal_mask(x.size(1), x.device)
+            mask = self._get_causal_mask(tokens, token_ids.device)
             for block in self.blocks:
                 x = block(x, causal_mask=mask)
 
             x = self.ln_f(x)
-            if tree_embedding is not None:
-                x = x[:, self.config.tree_prefix_tokens:, :]
             return self.unembed(x)
 
 
-def make_default_config(tree_embedding_dim: int = 256, tree_prefix_tokens: int = 4) -> Config:
+def make_default_config(embedding_mode: str = MODE_REGULAR) -> Config:
     return Config(
         d_model=256,
         d_hidden=1024,
@@ -466,104 +432,24 @@ def make_default_config(tree_embedding_dim: int = 256, tree_prefix_tokens: int =
         d_vocab=0,
         n_heads=4,
         num_blocks=6,
-        tree_embedding_dim=tree_embedding_dim,
-        tree_prefix_tokens=tree_prefix_tokens,
         max_seq_len=4096,
+        embedding_mode=embedding_mode,
+        max_parentheses_depth=64,
+        max_implication_distance=256,
     )
 
 
 def make_custom_logic_llm(
     config: Config | None = None,
-    tokenizer_kind: str = "word",
-) -> AstConditionedTransformer:
+    embedding_mode: str | None = None,
+) -> CustomLogicTransformer:
     _require_torch()
-    tokenizer = make_tokenizer(tokenizer_kind)
-    tokenizer.tokenizer_kind = tokenizer_kind
-    config = config or make_default_config()
-    return AstConditionedTransformer(config, tokenizer)
-
-
-def statement_prompt(
-    statement: LabeledStatement,
-    include_label: bool = True,
-    label_override: bool | None = None,
-) -> str:
-    prompt = (
-        "Formula:\n"
-        f"{statement.formula}\n"
-        "Question: tautology?\n"
-        "Answer:"
-    )
-    if include_label:
-        label = statement.label if label_override is None else label_override
-        prompt += f" {'true' if label else 'false'}"
-    return prompt
-
-
-def formula_prompt(formula: Formula) -> str:
-    return (
-        "Formula:\n"
-        f"{formula}\n"
-        "Question: tautology?\n"
-        "Answer:"
-    )
-
-
-def training_prompt_for_statement(model: AstConditionedTransformer, statement: LabeledStatement) -> str:
-    if getattr(model.tokenizer, "tokenizer_kind", "word") == "logic":
-        return logic_formula_prompt(statement.formula)
-    return statement_prompt(statement, include_label=False)
-
-
-def _hash_tree_embedding(formula: Formula, dim: int, device: str) -> torch.Tensor:
-    embedder = HashingTreeEmbedder(dim=dim)
-    return embedder.encode_formula(formula).to(device)
-
-
-def _trained_tree_embedding(encoder: FormulaTreeEncoder, formula: Formula, device: str) -> torch.Tensor:
-    encoder = encoder.to(device)
-    return encoder.encode_formula(formula)
-
-
-def tree_embedding_for_formula(
-    formula: Formula,
-    dim: int,
-    device: str,
-    trained_encoder: FormulaTreeEncoder | None = None,
-) -> torch.Tensor:
-    _require_torch()
-    if trained_encoder is not None:
-        embedding = _trained_tree_embedding(trained_encoder, formula, device)
-    else:
-        embedding = _hash_tree_embedding(formula, dim, device)
-
-    if embedding.numel() != dim:
-        raise ValueError(f"Tree embedding has dim {embedding.numel()}, but model expects {dim}")
-
-    return embedding
-
-
-def _pad_next_token_batch(
-    token_lists: Sequence[Sequence[int]],
-    pad_id: int,
-    device: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    usable = [list(ids) for ids in token_lists if len(ids) >= 2]
-    if not usable:
-        raise ValueError("Batch has no sequences with at least two tokens")
-
-    max_len = max(len(ids) - 1 for ids in usable)
-    x = torch.full((len(usable), max_len), pad_id, dtype=torch.long, device=device)
-    y = torch.full((len(usable), max_len), -100, dtype=torch.long, device=device)
-
-    for row, ids in enumerate(usable):
-        x_ids = ids[:-1]
-        y_ids = ids[1:]
-        length = len(x_ids)
-        x[row, :length] = torch.tensor(x_ids, dtype=torch.long, device=device)
-        y[row, :length] = torch.tensor(y_ids, dtype=torch.long, device=device)
-
-    return x, y
+    if config is None:
+        config = make_default_config(embedding_mode=normalize_embedding_mode(embedding_mode))
+    elif embedding_mode is not None:
+        config.embedding_mode = normalize_embedding_mode(embedding_mode)
+    tokenizer = make_tokenizer()
+    return CustomLogicTransformer(config, tokenizer)
 
 
 def _pad_answer_only_batch(
@@ -590,8 +476,6 @@ def _pad_answer_only_batch(
             )
 
         full_ids = prompt + answer
-        if len(full_ids) < 2:
-            raise ValueError("Batch has no sequences with at least two tokens")
         rows.append((full_ids, len(prompt), len(answer)))
 
     max_len = max(len(full_ids) - 1 for full_ids, _, _ in rows)
@@ -622,246 +506,64 @@ def _iter_batches(items: Sequence, batch_size: int):
         yield items[start:start + batch_size]
 
 
-def top_k_filter(logits: torch.Tensor, k: Optional[int]) -> torch.Tensor:
-    if k is None or k <= 0:
-        return logits
-    vocab = logits.size(-1)
-    k = min(k, vocab)
-    topk_vals, _ = torch.topk(logits, k, dim=-1)
-    cutoff = topk_vals[-1].unsqueeze(-1)
-    return logits.masked_fill(logits < cutoff, float("-inf"))
-
-
-@torch.no_grad() if torch is not None else (lambda fn: fn)
-def generate_sample(
-    model: AstConditionedTransformer,
-    prompt_tokens: torch.Tensor,
-    tree_embedding: torch.Tensor | None = None,
-    max_new_tokens: int = 6,
-    temperature: float = 0.7,
-    top_k: int | None = 20,
-) -> torch.Tensor:
-    _require_torch()
-    model.eval()
-    tokens = prompt_tokens
-
-    for _ in range(max_new_tokens):
-        logits = model(tokens, tree_embedding=tree_embedding)
-        next_logits = logits[0, -1] / max(float(temperature), 1e-8)
-        next_logits = top_k_filter(next_logits, top_k)
-        probs = F.softmax(next_logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        tokens = torch.cat([tokens, next_token], dim=0)
-
-    return tokens
-
-
-def train_on_labeled_statements_with_ast(
-    model: AstConditionedTransformer,
+def train_on_labeled_statements(
+    model: CustomLogicTransformer,
     statements: Sequence[LabeledStatement],
     epochs: int,
     lr: float,
     batch_size: int = 8,
     device: str | None = None,
     grad_clip: float | None = 1.0,
-    trained_encoder: FormulaTreeEncoder | None = None,
-    train_tree_encoder: bool = False,
-    use_ast: bool = True,
     save_path: str | Path | None = None,
-    progress_interval_epochs: int = 50,
+    progress_interval: int = 25,
 ) -> list[float]:
-    """
-    Train on labeled statement records.
-
-    For this project's labeled JSONL data, ``epochs`` means repeated training
-    iterations on one JSONL line before moving to the next line. Each optimizer
-    update sees exactly one statement record.
-    """
     _require_torch()
     if not statements:
         raise ValueError("statements must not be empty")
     if epochs < 1:
         raise ValueError("epochs must be at least 1")
-    if progress_interval_epochs < 1:
-        raise ValueError("progress_interval_epochs must be at least 1")
+    if progress_interval < 1:
+        raise ValueError("progress_interval must be at least 1")
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    if trained_encoder is not None:
-        trained_encoder.to(device)
-        trained_encoder.train(mode=train_tree_encoder)
-        for param in trained_encoder.parameters():
-            param.requires_grad = train_tree_encoder
 
-    prompts = [training_prompt_for_statement(model, statement) for statement in statements]
-    answers = [
-        f" {'true' if statement.label else 'false'}"
-        for statement in statements
-    ]
+    prompts = [statement_prompt(statement) for statement in statements]
+    answers = [TRUE_TOKEN if statement.label else FALSE_TOKEN for statement in statements]
+
     for prompt, answer in zip(prompts, answers):
         model.tokenizer.add_text(prompt)
         model.tokenizer.add_text(answer)
     pad_id = model.tokenizer.pad_id
     model.resize_vocab(model.tokenizer.vocab_size)
 
-    params = list(model.parameters())
-    if use_ast and trained_encoder is not None and train_tree_encoder:
-        params.extend(p for p in trained_encoder.parameters() if p.requires_grad)
-
-    optimizer = torch.optim.AdamW(params, lr=lr)
-    losses: list[float] = []
-    samples = list(zip(statements, prompts, answers))
-    update_index = 0
-    total_updates = len(samples) * epochs
-    skipped_lines = 0
-    skipped_updates = 0
-    last_line_index = 0
-    last_epoch_index = 0
-    last_loss = 0.0
-
-    for line_index, (statement, prompt, answer) in enumerate(samples, start=1):
-        encoded_prompt = model.tokenizer.encode(prompt)
-        encoded_answer = model.tokenizer.encode(answer)
-        input_tokens = len(encoded_prompt) + len(encoded_answer) - 1
-        extra_tokens = model.config.tree_prefix_tokens if use_ast else 0
-        total_tokens = input_tokens + extra_tokens
-        if total_tokens > model.config.max_seq_len:
-            skipped_lines += 1
-            print(
-                f"[warn] Skipping line {line_index}/{len(samples)}: "
-                f"tokenized length {total_tokens} exceeds max_seq_len={model.config.max_seq_len}"
-            )
-            continue
-
-        for epoch_index in range(1, epochs + 1):
-            try:
-                x, y = _pad_answer_only_batch(
-                    [encoded_prompt],
-                    [encoded_answer],
-                    pad_id=pad_id,
-                    device=device,
-                )
-
-                tree_vec = None
-                if use_ast:
-                    tree_vec = tree_embedding_for_formula(
-                        statement.formula,
-                        dim=model.config.tree_embedding_dim,
-                        device=device,
-                        trained_encoder=trained_encoder,
-                    ).unsqueeze(0)
-
-                logits = model(x, tree_embedding=tree_vec)
-                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
-
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                if grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(params, grad_clip)
-
-                optimizer.step()
-                update_index += 1
-                last_line_index = line_index
-                last_epoch_index = epoch_index
-                last_loss = loss.item()
-                losses.append(last_loss)
-
-                should_print = update_index % progress_interval_epochs == 0 or update_index == total_updates
-                if should_print:
-                    label = "AST-conditioned LLM" if use_ast else "regular-token-only custom LLM"
-                    print(
-                        f"line {line_index}/{len(samples)} | epoch {epoch_index}/{epochs} | "
-                        f"update {update_index}/{total_updates} | "
-                        f"{label} true/false answer loss {last_loss:.4f}"
-                    )
-            except (ValueError, RuntimeError) as exc:
-                skipped_updates += 1
-                print(
-                    f"[warn] Skipping line {line_index}/{len(samples)} epoch {epoch_index}/{epochs}: {exc}"
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                break
-
-    if skipped_lines or skipped_updates:
-        print(f"[warn] Skipped {skipped_lines} oversized lines and {skipped_updates} failed line-epochs.")
-    if not losses:
-        print("[warn] No custom statement training updates completed.")
-    elif update_index % progress_interval_epochs != 0 and update_index != total_updates:
-        label = "AST-conditioned LLM" if use_ast else "regular-token-only custom LLM"
-        print(
-            f"line {last_line_index}/{len(samples)} | epoch {last_epoch_index}/{epochs} | "
-            f"completed updates {update_index}/{total_updates} | "
-            f"{label} true/false answer loss {last_loss:.4f}"
-        )
-
-    if save_path is not None:
-        save_checkpoint(model, model.config, save_path)
-
-    return losses
-
-
-def _make_token_chunks(token_ids: Sequence[int], seq_len: int) -> list[list[int]]:
-    if seq_len < 1:
-        raise ValueError("seq_len must be at least 1")
-
-    window = seq_len + 1
-    chunks: list[list[int]] = []
-    for start in range(0, max(0, len(token_ids) - 1), seq_len):
-        chunk = list(token_ids[start:start + window])
-        if len(chunk) >= 2:
-            chunks.append(chunk)
-    return chunks
-
-
-def train_custom_llm_on_texts(
-    model: AstConditionedTransformer,
-    texts: Sequence[str],
-    epochs: int,
-    lr: float,
-    batch_size: int = 8,
-    seq_len: int = 128,
-    device: str | None = None,
-    grad_clip: float | None = 1.0,
-    save_path: str | Path | None = None,
-) -> list[float]:
-    """
-    Train the whole custom causal LM, including regular token embeddings.
-
-    This is text-only next-token training. It intentionally does not use AST
-    soft-prefix embeddings because Wikipedia prose is not a Formula AST.
-    """
-    _require_torch()
-    clean_texts = [text.strip() for text in texts if text and text.strip()]
-    if not clean_texts:
-        raise ValueError("texts must contain at least one non-empty string")
-
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    for text in clean_texts:
-        model.tokenizer.add_text(text)
-    pad_id = model.tokenizer.pad_id
-    model.resize_vocab(model.tokenizer.vocab_size)
-
-    chunks: list[list[int]] = []
-    for text in clean_texts:
-        chunks.extend(_make_token_chunks(model.tokenizer.encode(text), seq_len=seq_len))
-
-    if not chunks:
-        raise ValueError("No trainable token chunks were produced from the text")
+    encoded_samples = [
+        (model.tokenizer.encode(prompt), model.tokenizer.encode(answer))
+        for prompt, answer in zip(prompts, answers)
+    ]
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     losses: list[float] = []
+    update_index = 0
+    total_updates = epochs * ((len(encoded_samples) + batch_size - 1) // batch_size)
 
-    for epoch in range(epochs):
-        total_loss = 0.0
-        total_items = 0
+    for epoch_index in range(1, epochs + 1):
+        epoch_loss = 0.0
+        epoch_items = 0
 
-        for batch in _iter_batches(chunks, batch_size):
-            x, y = _pad_next_token_batch(batch, pad_id=pad_id, device=device)
-            logits = model(x, tree_embedding=None)
+        for batch in _iter_batches(encoded_samples, batch_size):
+            prompt_ids = [item[0] for item in batch]
+            answer_ids = [item[1] for item in batch]
+            input_tokens = max(len(prompt) + len(answer) - 1 for prompt, answer in batch)
+            if input_tokens > model.config.max_seq_len:
+                print(
+                    f"[warn] Skipping batch in epoch {epoch_index}: "
+                    f"tokenized length {input_tokens} exceeds max_seq_len={model.config.max_seq_len}"
+                )
+                continue
+
+            x, y = _pad_answer_only_batch(prompt_ids, answer_ids, pad_id=pad_id, device=device)
+            logits = model(x)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=-100)
 
             optimizer.zero_grad(set_to_none=True)
@@ -871,14 +573,22 @@ def train_custom_llm_on_texts(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
             optimizer.step()
-            total_loss += loss.item() * len(batch)
-            total_items += len(batch)
 
-        avg_loss = total_loss / max(1, total_items)
-        losses.append(avg_loss)
-        epoch_number = epoch + 1
-        if epoch_number % 50 == 0 or epoch_number == epochs:
-            print(f"epoch {epoch_number}/{epochs} | custom text LM loss {avg_loss:.4f}")
+            batch_loss = loss.item()
+            losses.append(batch_loss)
+            epoch_loss += batch_loss * len(batch)
+            epoch_items += len(batch)
+            update_index += 1
+
+            if update_index % progress_interval == 0 or update_index == total_updates:
+                print(
+                    f"epoch {epoch_index}/{epochs} | update {update_index}/{total_updates} | "
+                    f"{model.config.embedding_mode} answer loss {batch_loss:.4f}"
+                )
+
+        if epoch_items:
+            avg_loss = epoch_loss / epoch_items
+            print(f"epoch {epoch_index}/{epochs} | average answer loss {avg_loss:.4f}")
 
     if save_path is not None:
         save_checkpoint(model, model.config, save_path)
@@ -886,116 +596,24 @@ def train_custom_llm_on_texts(
     return losses
 
 
-def train_custom_llm_on_text_file(
-    model: AstConditionedTransformer,
-    text_path: str | Path,
+# Backward-compatible name for older callers in this repository.
+def train_on_labeled_statements_with_ast(
+    model: CustomLogicTransformer,
+    statements: Sequence[LabeledStatement],
     epochs: int,
     lr: float,
     batch_size: int = 8,
-    seq_len: int = 128,
     device: str | None = None,
     grad_clip: float | None = 1.0,
     save_path: str | Path | None = None,
+    **_: object,
 ) -> list[float]:
-    return train_custom_llm_on_text_files(
+    return train_on_labeled_statements(
         model=model,
-        text_paths=[text_path],
+        statements=statements,
         epochs=epochs,
         lr=lr,
         batch_size=batch_size,
-        seq_len=seq_len,
-        device=device,
-        grad_clip=grad_clip,
-        save_path=save_path,
-    )
-
-
-def train_custom_llm_on_text_files(
-    model: AstConditionedTransformer,
-    text_paths: Sequence[str | Path],
-    epochs: int,
-    lr: float,
-    batch_size: int = 8,
-    seq_len: int = 128,
-    device: str | None = None,
-    grad_clip: float | None = 1.0,
-    save_path: str | Path | None = None,
-) -> list[float]:
-    texts = read_plain_text_files(text_paths)
-    if not texts:
-        raise ValueError("No plain text files contained trainable text")
-
-    return train_custom_llm_on_texts(
-        model=model,
-        texts=texts,
-        epochs=epochs,
-        lr=lr,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        device=device,
-        grad_clip=grad_clip,
-        save_path=save_path,
-    )
-
-
-def train_custom_llm_on_wikipedia_file(
-    model: AstConditionedTransformer,
-    titles_path: str | Path,
-    epochs: int,
-    lr: float,
-    batch_size: int = 8,
-    seq_len: int = 128,
-    device: str | None = None,
-    grad_clip: float | None = 1.0,
-    save_path: str | Path | None = None,
-    min_chars: int = 200,
-) -> list[float]:
-    texts = collect_wikipedia_article_texts(titles_path=titles_path, min_chars=min_chars)
-
-    return train_custom_llm_on_texts(
-        model=model,
-        texts=texts,
-        epochs=epochs,
-        lr=lr,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        device=device,
-        grad_clip=grad_clip,
-        save_path=save_path,
-    )
-
-
-def train_custom_llm_on_text_and_wikipedia_files(
-    model: AstConditionedTransformer,
-    text_paths: Sequence[str | Path] | None,
-    titles_path: str | Path | None,
-    epochs: int,
-    lr: float,
-    batch_size: int = 8,
-    seq_len: int = 128,
-    device: str | None = None,
-    grad_clip: float | None = 1.0,
-    save_path: str | Path | None = None,
-    min_chars: int = 200,
-) -> list[float]:
-    texts: list[str] = []
-
-    if text_paths:
-        texts.extend(read_plain_text_files(text_paths))
-
-    if titles_path is not None:
-        texts.extend(collect_wikipedia_article_texts(titles_path=titles_path, min_chars=min_chars))
-
-    if not texts:
-        raise ValueError("No trainable text was loaded from plain text files or Wikipedia")
-
-    return train_custom_llm_on_texts(
-        model=model,
-        texts=texts,
-        epochs=epochs,
-        lr=lr,
-        batch_size=batch_size,
-        seq_len=seq_len,
         device=device,
         grad_clip=grad_clip,
         save_path=save_path,
@@ -1003,36 +621,48 @@ def train_custom_llm_on_text_and_wikipedia_files(
 
 
 @torch.no_grad() if torch is not None else (lambda fn: fn)
-def predict_truth_text(
-    model: AstConditionedTransformer,
-    formula: Formula,
+def predict_truth_label(
+    model: CustomLogicTransformer,
+    formula: Formula | str,
     device: str | None = None,
-    trained_encoder: FormulaTreeEncoder | None = None,
-    use_ast: bool = True,
-) -> str:
+) -> tuple[bool, float]:
     _require_torch()
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
 
-    prompt = logic_formula_prompt(formula) if getattr(model.tokenizer, "tokenizer_kind", "word") == "logic" else formula_prompt(formula)
+    model.tokenizer.add_word(TRUE_TOKEN)
+    model.tokenizer.add_word(FALSE_TOKEN)
+    prompt = formula_prompt(formula)
     ids = model.tokenizer.encode(prompt)
     model.resize_vocab(model.tokenizer.vocab_size)
-    tokens = torch.tensor(ids, dtype=torch.long, device=device)
-    tree_vec = None
-    if use_ast:
-        tree_vec = tree_embedding_for_formula(
-            formula,
-            dim=model.config.tree_embedding_dim,
-            device=device,
-            trained_encoder=trained_encoder,
-        )
-    out = generate_sample(model, tokens, tree_embedding=tree_vec)
-    generated_ids = out[len(ids):]
-    return model.tokenizer.decode(generated_ids.tolist())
+
+    token_tensor = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    logits = model(token_tensor)[0, -1]
+
+    true_id = model.tokenizer.stoi[TRUE_TOKEN]
+    false_id = model.tokenizer.stoi[FALSE_TOKEN]
+    selected_logits = torch.stack([logits[false_id], logits[true_id]])
+    probs = F.softmax(selected_logits, dim=0)
+    false_prob = float(probs[0].item())
+    true_prob = float(probs[1].item())
+    prediction = true_prob >= false_prob
+    confidence = true_prob if prediction else false_prob
+    return prediction, confidence
 
 
-def save_checkpoint(model: AstConditionedTransformer, config: Config, path: str | Path) -> Path:
+@torch.no_grad() if torch is not None else (lambda fn: fn)
+def predict_truth_text(
+    model: CustomLogicTransformer,
+    formula: Formula | str,
+    device: str | None = None,
+    **_: object,
+) -> str:
+    prediction, confidence = predict_truth_label(model, formula, device=device)
+    return f"{TRUE_TOKEN if prediction else FALSE_TOKEN} ({confidence:.2%})"
+
+
+def save_checkpoint(model: CustomLogicTransformer, config: Config, path: str | Path) -> Path:
     _require_torch()
     output_path = Path(path)
     if output_path.parent != Path("."):
@@ -1040,19 +670,9 @@ def save_checkpoint(model: AstConditionedTransformer, config: Config, path: str 
 
     torch.save(
         {
-            "config": {
-                "d_model": config.d_model,
-                "d_hidden": config.d_hidden,
-                "d_head": config.d_head,
-                "d_vocab": 0,
-                "n_heads": config.n_heads,
-                "num_blocks": config.num_blocks,
-                "tree_embedding_dim": config.tree_embedding_dim,
-                "tree_prefix_tokens": config.tree_prefix_tokens,
-                "max_seq_len": config.max_seq_len,
-            },
+            "config": asdict(config),
             "stoi": model.tokenizer.stoi,
-            "tokenizer_kind": getattr(model.tokenizer, "tokenizer_kind", "word"),
+            "embedding_mode": config.embedding_mode,
             "model_state": model.state_dict(),
         },
         output_path,
@@ -1060,20 +680,28 @@ def save_checkpoint(model: AstConditionedTransformer, config: Config, path: str 
     return output_path
 
 
-def load_checkpoint(path: str | Path, device: str = "cpu") -> tuple[AstConditionedTransformer, Config] | None:
+def _config_from_checkpoint(raw_config: dict, embedding_mode: str | None = None) -> Config:
+    valid_fields = {field.name for field in fields(Config)}
+    cleaned = {key: value for key, value in raw_config.items() if key in valid_fields}
+    defaults = asdict(make_default_config())
+    defaults.update(cleaned)
+    if embedding_mode is not None:
+        defaults["embedding_mode"] = embedding_mode
+    return Config(**defaults)
+
+
+def load_checkpoint(path: str | Path, device: str = "cpu") -> tuple[CustomLogicTransformer, Config] | None:
     _require_torch()
     if not os.path.exists(path):
         return None
 
     checkpoint = torch.load(path, map_location=device)
-    config_dict = dict(checkpoint["config"])
-    config_dict.setdefault("tree_prefix_tokens", 4)
-    config_dict.setdefault("max_seq_len", 4096)
-    config = Config(**config_dict)
-    tokenizer_kind = checkpoint.get("tokenizer_kind", "word")
-    tokenizer = make_tokenizer(tokenizer_kind, stoi=checkpoint["stoi"])
-    tokenizer.tokenizer_kind = tokenizer_kind
-    model = AstConditionedTransformer(config, tokenizer).to(device)
+    config = _config_from_checkpoint(
+        dict(checkpoint.get("config", {})),
+        embedding_mode=checkpoint.get("embedding_mode"),
+    )
+    tokenizer = make_tokenizer(stoi=checkpoint["stoi"])
+    model = CustomLogicTransformer(config, tokenizer).to(device)
     model.resize_vocab(model.tokenizer.vocab_size)
     model.load_state_dict(checkpoint["model_state"], strict=False)
     model.eval()
