@@ -3,18 +3,15 @@ from __future__ import annotations
 import math
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Optional, Sequence
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-except ModuleNotFoundError:
-    torch = None
-    nn = None
-    F = None
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from logic import Formula
 from statement_generation import LabeledStatement, formula_to_text
@@ -85,6 +82,15 @@ SIDE_LHS = 1
 SIDE_IMPLICATION = 2
 SIDE_RHS = 3
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return self.weight * (x / rms)
 
 def _require_torch() -> None:
     if torch is None or nn is None or F is None:
@@ -317,9 +323,9 @@ else:
     class TransformerBlock(nn.Module):
         def __init__(self, config: Config):
             super().__init__()
-            self.ln1 = nn.LayerNorm(config.d_model)
+            self.ln1 = RMSNorm(config.d_model)
             self.attn = AttentionHead(config)
-            self.ln2 = nn.LayerNorm(config.d_model)
+            self.ln2 = RMSNorm(config.d_model)
             self.mlp = MLP(config)
 
         def forward(self, x: torch.Tensor, causal_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -340,7 +346,7 @@ else:
             self.logical_emb = nn.Embedding(7, config.d_model)
             self.distance_emb = nn.Embedding(config.max_implication_distance + 1, config.d_model)
             self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_blocks)])
-            self.ln_f = nn.LayerNorm(config.d_model)
+            self.ln_f = RMSNorm(config.d_model)
             self.unembed = nn.Linear(config.d_model, tokenizer.vocab_size)
             self.register_buffer("_causal_mask", None, persistent=False)
             self._init_std = 0.02
@@ -504,7 +510,15 @@ def _iter_batches(items: Sequence, batch_size: int):
         raise ValueError("batch_size must be at least 1")
     for start in range(0, len(items), batch_size):
         yield items[start:start + batch_size]
+def format_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
 
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
 
 def train_on_labeled_statements(
     model: CustomLogicTransformer,
@@ -546,6 +560,7 @@ def train_on_labeled_statements(
     losses: list[float] = []
     update_index = 0
     total_updates = epochs * ((len(encoded_samples) + batch_size - 1) // batch_size)
+    training_start_time = time.time()
 
     for epoch_index in range(1, epochs + 1):
         epoch_loss = 0.0
@@ -579,11 +594,20 @@ def train_on_labeled_statements(
             epoch_loss += batch_loss * len(batch)
             epoch_items += len(batch)
             update_index += 1
-
             if update_index % progress_interval == 0 or update_index == total_updates:
+                elapsed = time.time() - training_start_time
+                updates_per_second = update_index / elapsed if elapsed > 0 else 0.0
+                remaining_updates = total_updates - update_index
+
+                if updates_per_second > 0:
+                    remaining_seconds = remaining_updates / updates_per_second
+                else:
+                    remaining_seconds = 0.0
+
                 print(
                     f"epoch {epoch_index}/{epochs} | update {update_index}/{total_updates} | "
-                    f"{model.config.embedding_mode} answer loss {batch_loss:.4f}"
+                    f"{model.config.embedding_mode} answer loss {batch_loss:.4f} | "
+                    f"time remaining: {format_seconds(remaining_seconds)}"
                 )
 
         if epoch_items:
