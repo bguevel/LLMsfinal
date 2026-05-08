@@ -31,6 +31,7 @@ DATA_DIR = Path("data")
 GENERATED_DATA_DEFAULT = DATA_DIR / "generated_truth_eval.txt"
 GENERATION_CONFIG_DEFAULT = DATA_DIR / "generations.txt"
 PLOT_DEFAULT = DATA_DIR / "complexity_accuracy.svg"
+ALL_MODES_PLOT_DEFAULT = DATA_DIR / "complexity_accuracy_by_mode.svg"
 LOSS_PLOT_DEFAULT = DATA_DIR / "average_loss_by_mode.svg"
 
 
@@ -608,12 +609,148 @@ def write_accuracy_plot(metrics: dict[str, dict[str, float]], output_path: Path)
     return output_path
 
 
+def accuracy_plot_modes(metrics_by_mode: dict[str, dict[str, dict[str, float]]]) -> list[str]:
+    ordered_modes = [mode for mode in EMBEDDING_MODES if mode in metrics_by_mode]
+    ordered_modes.extend(mode for mode in metrics_by_mode if mode not in ordered_modes)
+    return ordered_modes
+
+
+def accuracy_plot_labels(metrics_by_mode: dict[str, dict[str, dict[str, float]]]) -> list[str]:
+    labels = {
+        label
+        for mode_metrics in metrics_by_mode.values()
+        for label in mode_metrics
+    }
+    return sorted(labels, key=complexity_sort_key)
+
+
+def write_svg_accuracy_comparison_plot(
+    metrics_by_mode: dict[str, dict[str, dict[str, float]]],
+    output_path: Path,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    labels = accuracy_plot_labels(metrics_by_mode)
+    modes = accuracy_plot_modes(metrics_by_mode)
+    width = max(820, 170 * max(1, len(labels)))
+    height = 480
+    margin_left = 75
+    margin_right = 180
+    margin_top = 40
+    margin_bottom = 95
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+    group_width = plot_width / max(1, len(labels))
+    bar_gap = 3
+    max_bar_width = 24
+    available_bar_width = max(6, (group_width - 22) / max(1, len(modes)) - bar_gap)
+    bar_width = min(max_bar_width, available_bar_width)
+    colors = ("#2563eb", "#059669", "#dc2626", "#7c3aed", "#d97706", "#0891b2", "#4b5563")
+
+    svg: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="{width / 2}" y="26" text-anchor="middle" font-family="Arial" font-size="18" fill="#111827">Complexity vs Accuracy by Mode</text>',
+        f'<line x1="{margin_left}" y1="{margin_top}" x2="{margin_left}" y2="{height - margin_bottom}" stroke="#374151" stroke-width="1"/>',
+        f'<line x1="{margin_left}" y1="{height - margin_bottom}" x2="{width - margin_right}" y2="{height - margin_bottom}" stroke="#374151" stroke-width="1"/>',
+    ]
+
+    for tick in range(0, 101, 25):
+        y = margin_top + plot_height * (1 - tick / 100)
+        svg.append(f'<line x1="{margin_left - 5}" y1="{y:.1f}" x2="{width - margin_right}" y2="{y:.1f}" stroke="#e5e7eb" stroke-width="1"/>')
+        svg.append(f'<text x="{margin_left - 10}" y="{y + 4:.1f}" text-anchor="end" font-family="Arial" font-size="12" fill="#4b5563">{tick}%</text>')
+
+    for label_index, label in enumerate(labels):
+        group_left = margin_left + label_index * group_width
+        total_bar_width = len(modes) * bar_width + max(0, len(modes) - 1) * bar_gap
+        x_start = group_left + (group_width - total_bar_width) / 2
+        for mode_index, mode in enumerate(modes):
+            row = metrics_by_mode[mode].get(label)
+            if row is None:
+                continue
+            accuracy = float(row["accuracy"])
+            bar_height = plot_height * accuracy
+            x = x_start + mode_index * (bar_width + bar_gap)
+            y = margin_top + plot_height - bar_height
+            color = colors[mode_index % len(colors)]
+            svg.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{bar_height:.1f}" fill="{color}"/>')
+            if bar_width >= 12:
+                svg.append(f'<text x="{x + bar_width / 2:.1f}" y="{y - 5:.1f}" text-anchor="middle" font-family="Arial" font-size="10" fill="#111827">{accuracy:.0%}</text>')
+
+        label_x = group_left + group_width / 2
+        svg.append(
+            f'<text x="{label_x:.1f}" y="{height - margin_bottom + 22}" text-anchor="middle" '
+            f'font-family="Arial" font-size="12" fill="#111827">{html.escape(label)}</text>'
+        )
+
+    for mode_index, mode in enumerate(modes):
+        color = colors[mode_index % len(colors)]
+        legend_y = margin_top + 20 + mode_index * 24
+        legend_x = width - margin_right + 28
+        svg.append(f'<rect x="{legend_x}" y="{legend_y - 9}" width="16" height="12" fill="{color}"/>')
+        svg.append(
+            f'<text x="{legend_x + 24}" y="{legend_y + 1}" font-family="Arial" font-size="12" fill="#111827">'
+            f'{html.escape(mode)}</text>'
+        )
+
+    svg.append(f'<text x="20" y="{height / 2}" transform="rotate(-90 20 {height / 2})" text-anchor="middle" font-family="Arial" font-size="13" fill="#111827">Accuracy</text>')
+    svg.append(f'<text x="{margin_left + plot_width / 2}" y="{height - 18}" text-anchor="middle" font-family="Arial" font-size="13" fill="#111827">Statement Complexity</text>')
+    svg.append("</svg>")
+    output_path.write_text("\n".join(svg), encoding="utf-8")
+    return output_path
+
+
+def write_accuracy_comparison_plot(
+    metrics_by_mode: dict[str, dict[str, dict[str, float]]],
+    output_path: Path,
+) -> Path:
+    labels = accuracy_plot_labels(metrics_by_mode)
+    modes = accuracy_plot_modes(metrics_by_mode)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        if output_path.suffix.lower() != ".svg":
+            output_path = output_path.with_suffix(".svg")
+        return write_svg_accuracy_comparison_plot(metrics_by_mode, output_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    x_positions = list(range(len(labels)))
+    group_width = 0.82
+    bar_width = group_width / max(1, len(modes))
+    start_offset = -group_width / 2 + bar_width / 2
+
+    plt.figure(figsize=(max(8.2, len(labels) * 1.15), 5.0))
+    for mode_index, mode in enumerate(modes):
+        offsets = [x + start_offset + mode_index * bar_width for x in x_positions]
+        accuracies = [
+            metrics_by_mode[mode].get(label, {}).get("accuracy", 0.0)
+            for label in labels
+        ]
+        plt.bar(offsets, accuracies, width=bar_width * 0.92, label=mode)
+
+    plt.ylim(0, 1)
+    plt.ylabel("Accuracy")
+    plt.xlabel("Statement complexity")
+    plt.title("Complexity vs Accuracy by Mode")
+    plt.xticks(x_positions, labels, rotation=35, ha="right")
+    plt.grid(axis="y", alpha=0.25)
+    plt.legend(title="Mode")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    return output_path
+
+
 def test_custom_model_menu() -> None:
-    print("\n--- Test custom model on a file ---")
-    mode = choose_embedding_mode()
-    weights_path = ask_path("Custom weights filename", default=default_weights_for_mode(mode))
+    print("\n--- Test all custom embedding modes on a file ---")
+    print("Modes will be tested using the default per-mode checkpoints:")
+    for index, mode in enumerate(EMBEDDING_MODES, start=1):
+        print(f"{index}) {mode}: {default_weights_for_mode(mode)}")
+
     input_path = ask_path("Testing data text filename", default=GENERATED_DATA_DEFAULT)
-    plot_path = ask_path("Save complexity accuracy plot as", default=PLOT_DEFAULT)
+    plot_path = ask_path("Save complexity accuracy plot as", default=ALL_MODES_PLOT_DEFAULT)
 
     print("[check] Verifying symbolic truth labels before testing...")
     statements = load_labeled_statements(input_path, verify_labels=True)
@@ -622,33 +759,47 @@ def test_custom_model_menu() -> None:
         return
     print(f"[ok] Verified {len(statements)} symbolic truth labels.")
 
-    try:
-        loaded = load_custom_llm_checkpoint(weights_path)
-        if loaded is None:
-            print(f"[warn] No checkpoint found at {weights_path}")
+    metrics_by_mode: dict[str, dict[str, dict[str, float]]] = {}
+
+    for mode in EMBEDDING_MODES:
+        weights_path = default_weights_for_mode(mode)
+        model = None
+        print(f"\n--- Testing mode: {mode} ---")
+        try:
+            loaded = load_custom_llm_checkpoint(weights_path)
+            if loaded is None:
+                print(f"[warn] No checkpoint found at {weights_path}; skipping {mode}.")
+                continue
+            model, _ = loaded
+            if model.config.embedding_mode != mode:
+                print(
+                    f"[warn] Loaded checkpoint mode is {model.config.embedding_mode}; "
+                    f"evaluating with requested mode {mode}."
+                )
+                model.config.embedding_mode = mode
+            metrics, correct, total = evaluate_custom_model(model, statements)
+            metrics_by_mode[mode] = metrics
+            overall_accuracy = correct / total if total else 0.0
+            print(f"\n[ok] {mode} overall accuracy: {correct}/{total} ({overall_accuracy:.2%})")
+            print("By complexity:")
+            for label in sorted(metrics, key=complexity_sort_key):
+                row = metrics[label]
+                print(f"  {label}: {int(row['correct'])}/{int(row['total'])} ({row['accuracy']:.2%})")
+        except ModuleNotFoundError as exc:
+            print(f"[warn] {exc}")
             return
-        model, _ = loaded
-        if model.config.embedding_mode != mode:
-            print(
-                f"[warn] Loaded checkpoint mode is {model.config.embedding_mode}; "
-                f"evaluating with requested mode {mode}."
-            )
-            model.config.embedding_mode = mode
-        metrics, correct, total = evaluate_custom_model(model, statements)
-        overall_accuracy = correct / total if total else 0.0
-        print(f"\n[ok] Overall accuracy: {correct}/{total} ({overall_accuracy:.2%})")
-        print("By complexity:")
-        for label in sorted(metrics, key=complexity_sort_key):
-            row = metrics[label]
-            print(f"  {label}: {int(row['correct'])}/{int(row['total'])} ({row['accuracy']:.2%})")
-        written_plot = write_accuracy_plot(metrics, plot_path)
-        print(f"[ok] Wrote complexity accuracy plot to {written_plot}")
-    except ModuleNotFoundError as exc:
-        print(f"[warn] {exc}")
-    except Exception as exc:
-        warn_error("Custom model testing", exc)
-    finally:
-        cleanup_after_training("custom model testing")
+        except Exception as exc:
+            warn_error(f"{mode} custom model testing", exc)
+        finally:
+            model = None
+            cleanup_after_training(f"{mode} custom model testing")
+
+    if not metrics_by_mode:
+        print("[warn] No modes were evaluated, so no plot was written.")
+        return
+
+    written_plot = write_accuracy_comparison_plot(metrics_by_mode, plot_path)
+    print(f"\n[ok] Wrote complexity accuracy comparison plot to {written_plot}")
 
 
 def main() -> None:
@@ -660,7 +811,7 @@ def main() -> None:
         print("0) Train all custom embedding modes sequentially")
         print("1) Generate data")
         print("2) Train custom model")
-        print("3) Test custom model on a file and plot complexity accuracy")
+        print("3) Test all custom embedding modes on a file and plot complexity accuracy")
         print("q) Quit")
 
         choice = input("select> ").strip().lower()
